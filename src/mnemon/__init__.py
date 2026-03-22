@@ -60,7 +60,22 @@ def __getattr__(name: str) -> object:
         "providers": "mnemon.providers",
         "learning": "mnemon.learning",
         "control": "mnemon.control",
+        "evaluation": "mnemon.evaluation",
     }
+
+    # Lazy-loaded classes from mnemon.factory
+    _lazy_classes = {
+        "Mnemon": ("mnemon.factory", "Mnemon"),
+        "MnemonFactory": ("mnemon.factory", "MnemonFactory"),
+    }
+    if name in _lazy_classes:
+        import importlib
+
+        mod_path, cls_name = _lazy_classes[name]
+        module = importlib.import_module(mod_path)
+        obj = getattr(module, cls_name)
+        globals()[name] = obj
+        return obj
     if name in _lazy_modules:
         import importlib
 
@@ -94,10 +109,14 @@ __all__ = [
     "PerceptUnit",
     "Skill",
     "WorkingMemoryState",
+    # Factory (lazy)
+    "Mnemon",
+    "MnemonFactory",
     # Lazy submodules
     "memory",
     "backends",
     "providers",
     "learning",
     "control",
+    "evaluation",
 ]

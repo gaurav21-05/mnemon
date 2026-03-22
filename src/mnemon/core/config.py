@@ -537,6 +537,27 @@ class MetaCognitionConfig(BaseSettings):
     )
 
 
+class QdrantConfig(BaseSettings):
+    """Qdrant vector store connection and performance settings."""
+
+    model_config = SettingsConfigDict(env_prefix="MNEMON__QDRANT__", env_nested_delimiter="__")
+
+    host: str = Field(default="localhost")
+    port: int = Field(default=6333)
+    grpc_port: int = Field(default=6334)
+    prefer_grpc: bool = Field(default=True)
+    collection_name: str = Field(default="mnemon_vectors")
+    dimension: int | None = Field(default=None)
+    binary_quantization: bool = Field(
+        default=False,
+        description="Enable binary quantization for 40x speedup on large collections.",
+    )
+    on_disk: bool = Field(
+        default=False,
+        description="Store vectors on disk for memory-constrained environments.",
+    )
+
+
 class LLMConfig(BaseSettings):
     """
     Configuration for LLM provider routing via LiteLLM.
@@ -595,6 +616,7 @@ class MnemonConfig(BaseSettings):
     attention: AttentionConfig = Field(default_factory=AttentionConfig)
     meta_cognition: MetaCognitionConfig = Field(default_factory=MetaCognitionConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    qdrant: QdrantConfig = Field(default_factory=QdrantConfig)
 
 
 # ---------------------------------------------------------------------------

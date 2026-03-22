@@ -28,3 +28,37 @@ Document stores:
 The ``ModuleRegistry.from_config()`` factory auto-detects which extras are
 installed and wires in the appropriate backend without any manual config.
 """
+
+from mnemon.backends.memory_store import (
+    InMemoryDocumentStore,
+    InMemoryGraphStore,
+    InMemoryVectorStore,
+)
+
+# Optional production backends — imported lazily to avoid hard dependency on
+# qdrant-client, falkordb, or aiosqlite when they are not installed.
+try:
+    from mnemon.backends.qdrant_store import QdrantVectorStore
+except ImportError:
+    QdrantVectorStore = None  # type: ignore[assignment,misc]
+
+try:
+    from mnemon.backends.falkordb_store import FalkorDBGraphStore
+except ImportError:
+    FalkorDBGraphStore = None  # type: ignore[assignment,misc]
+
+try:
+    from mnemon.backends.sqlite_store import SQLiteDocumentStore
+except ImportError:
+    SQLiteDocumentStore = None  # type: ignore[assignment,misc]
+
+__all__ = [
+    # Always available (no extra dependencies)
+    "InMemoryVectorStore",
+    "InMemoryDocumentStore",
+    "InMemoryGraphStore",
+    # Optional production backends
+    "QdrantVectorStore",
+    "FalkorDBGraphStore",
+    "SQLiteDocumentStore",
+]

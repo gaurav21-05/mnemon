@@ -31,6 +31,7 @@ igraph = {version = "^0.11", optional = true}
 neo4j = {version = "^5.20", optional = true}
 asyncpg = {version = "^0.29", optional = true}
 aiosqlite = {version = "^0.20", optional = true}
+apscheduler = {version = "^4.0", optional = true}
 
 [tool.poetry.extras]
 qdrant = ["qdrant-client"]
@@ -40,10 +41,12 @@ igraph = ["igraph"]
 neo4j = ["neo4j"]
 postgres = ["asyncpg"]
 sqlite = ["aiosqlite"]
+scheduler = ["apscheduler"]
 all = [
     "qdrant-client", "hnswlib",
     "falkordb", "igraph", "neo4j",
     "asyncpg", "aiosqlite",
+    "apscheduler",
 ]
 
 [tool.poetry.group.dev.dependencies]
