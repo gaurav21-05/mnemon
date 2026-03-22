@@ -1,0 +1,75 @@
+[tool.poetry]
+name = "mnemon"
+version = "0.1.0"
+description = "A brain-like cognitive memory framework for AI agents"
+authors = ["Rohit"]
+license = "Apache-2.0"
+readme = "README.md"
+packages = [{include = "mnemon", from = "src"}]
+keywords = ["ai", "agents", "memory", "cognitive", "brain-inspired"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.12",
+]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+pydantic = "^2.7"
+pydantic-settings = "^2.3"
+anyio = "^4.4"
+litellm = "^1.40"
+typing-extensions = "^4.12"
+
+# Optional backends
+qdrant-client = {version = "^1.9", optional = true}
+hnswlib = {version = "^0.8", optional = true}
+falkordb = {version = "^1.0", optional = true}
+igraph = {version = "^0.11", optional = true}
+neo4j = {version = "^5.20", optional = true}
+asyncpg = {version = "^0.29", optional = true}
+aiosqlite = {version = "^0.20", optional = true}
+
+[tool.poetry.extras]
+qdrant = ["qdrant-client"]
+hnswlib = ["hnswlib"]
+falkordb = ["falkordb"]
+igraph = ["igraph"]
+neo4j = ["neo4j"]
+postgres = ["asyncpg"]
+sqlite = ["aiosqlite"]
+all = [
+    "qdrant-client", "hnswlib",
+    "falkordb", "igraph", "neo4j",
+    "asyncpg", "aiosqlite",
+]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2"
+pytest-asyncio = "^0.23"
+pytest-benchmark = "^4.0"
+hypothesis = "^6.100"
+ruff = "^0.5"
+mypy = "^1.10"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
