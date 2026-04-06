@@ -78,6 +78,8 @@ class DaemonIPCServer:
         self._running = False
         # Rolling conversation history — last 20 turns (user+assistant pairs)
         self._chat_history: deque[dict[str, str]] = deque(maxlen=40)
+        # Lazy-initialised browser tool
+        self._browser: Any = None
         self._handlers: dict[str, Any] = {
             "chat": self._rpc_chat,
             "status": self._rpc_status,
@@ -88,6 +90,7 @@ class DaemonIPCServer:
             "deny": self._rpc_deny,
             "pending": self._rpc_pending,
             "inbox.mark_read": self._rpc_inbox_mark_read,
+            "browse": self._rpc_browse,
             "shutdown": self._rpc_shutdown,
         }
 
@@ -206,12 +209,21 @@ class DaemonIPCServer:
             result = await self._brain.run_cycle(raw_input=message)
             deliberation = result.get("deliberation", {})
 
+            # Detect if the user is asking Jarvis to research/browse something
+            browse_result = ""
+            if await self._is_browse_request(message):
+                browse_result = await self._handle_browse_request(message)
+
             # Pass pending curiosity question as context — let the LLM weave it
             # in naturally only if the conversation flow allows it
             pending_q = self._pop_curiosity_question()
 
             # Generate reply with full conversation history + retrieved memories
-            reply = await self._generate_reply(message, deliberation, pending_curiosity=pending_q)
+            reply = await self._generate_reply(
+                message, deliberation,
+                pending_curiosity=pending_q,
+                browse_result=browse_result,
+            )
 
             # Update conversation history
             self._chat_history.append({"role": "user", "content": message})
@@ -236,11 +248,34 @@ class DaemonIPCServer:
             return q
         return ""
 
+    async def _is_browse_request(self, message: str) -> bool:
+        """Detect if the user is asking Jarvis to look something up online."""
+        msg = message.lower()
+        browse_keywords = (
+            "research", "look up", "find", "search", "browse",
+            "check online", "what is", "who is", "how does", "latest",
+            "news about", "strategy", "script that", "write a script",
+            "can you find", "find me", "get me",
+        )
+        return any(kw in msg for kw in browse_keywords)
+
+    async def _handle_browse_request(self, message: str) -> str:
+        """Run a browse task derived from the user's message."""
+        logger.info("Browse request detected: %s", message[:80])
+        try:
+            browser = self._get_browser()
+            result = await browser.browse(message, store_in_memory=True)
+            return result
+        except Exception as exc:
+            logger.warning("Browse request failed: %s", exc)
+            return ""
+
     async def _generate_reply(
         self,
         message: str,
         deliberation: dict[str, Any],
         pending_curiosity: str = "",
+        browse_result: str = "",
     ) -> str:
         """Generate a conversational reply using full history and retrieved memories."""
         try:
@@ -273,8 +308,14 @@ class DaemonIPCServer:
             else:
                 system = _JARVIS_SYSTEM_BASE
 
-            # If there's a curiosity question from idle thinking, hint the model
-            # to weave it in only if the reply naturally allows it — not forced
+            # Inject live browsing results if we did a browse
+            if browse_result:
+                system += (
+                    f"\n\nYou just browsed the web for the user's request. Here is what you found:\n"
+                    f"{browse_result[:3000]}\n\n"
+                    "Use this to answer the user's question. Be specific and reference actual findings."
+                )
+
             if pending_curiosity:
                 system += (
                     f"\n\nYou've been thinking about asking: \"{pending_curiosity}\""
@@ -326,6 +367,21 @@ class DaemonIPCServer:
         """Mark proactive inbox messages as read."""
         count = self._state.mark_inbox_read(message_id)
         return {"marked": count}
+
+    async def _rpc_browse(self, task: str = "") -> dict[str, Any]:
+        """Browse the web for a task and return a text summary."""
+        if not task:
+            return {"error": "task is required"}
+        browser = self._get_browser()
+        result = await browser.browse(task, store_in_memory=True)
+        return {"result": result, "task": task}
+
+    def _get_browser(self) -> Any:
+        """Lazily initialise the JarvisBrowser."""
+        if self._browser is None:
+            from mnemon.daemon.tools.browser import JarvisBrowser
+            self._browser = JarvisBrowser(brain=self._brain)
+        return self._browser
 
     async def _rpc_thoughts(self, limit: int = 10) -> list[dict[str, Any]]:
         """Return recent idle thinking results."""

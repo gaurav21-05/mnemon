@@ -46,9 +46,10 @@ HELP_TEXT = """\
 /status — Daemon stats (cycles, uptime, last think)
 /soul — Read Jarvis's soul file
 /master — What Jarvis knows about you
+/browse <query> — Browse the web for something
 /help — This message
 
-Or just send any message to chat.
+Or just send any message to chat (Jarvis auto-browses when relevant).
 """
 
 
@@ -102,6 +103,7 @@ class JarvisTelegramBot:
         self._app.add_handler(CommandHandler("soul", self._cmd_soul))
         self._app.add_handler(CommandHandler("master", self._cmd_master))
         self._app.add_handler(CommandHandler("help", self._cmd_help))
+        self._app.add_handler(CommandHandler("browse", self._cmd_browse))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
         )
@@ -285,6 +287,23 @@ class JarvisTelegramBot:
             return
         content = soul_path.read_text()[:3000]
         await update.message.reply_text(f"```\n{content}\n```", parse_mode="Markdown")
+
+    async def _cmd_browse(self, update, context) -> None:
+        if not self._is_authorized(update):
+            return
+        query = " ".join(context.args) if context.args else ""
+        if not query:
+            await update.message.reply_text("Usage: /browse <what to search for>")
+            return
+        await update.message.reply_text(f"🌐 Browsing: {query}\n_(this may take up to 2 minutes)_", parse_mode="Markdown")
+        try:
+            from mnemon.daemon.cli.client import DaemonClient
+            client = DaemonClient(self._socket_path)
+            result = await client.browse(query)
+            text = result.get("result", "(no result)")[:3500]
+            await update.message.reply_text(f"🌐 *Research result:*\n\n{text}", parse_mode="Markdown")
+        except Exception as exc:
+            await update.message.reply_text(f"Browse failed: {exc}")
 
     async def _cmd_master(self, update, context) -> None:
         if not self._is_authorized(update):

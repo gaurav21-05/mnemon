@@ -88,6 +88,9 @@ class DaemonClient:
     async def pending(self) -> list[dict[str, Any]]:
         return await self.call("pending")
 
+    async def browse(self, task: str) -> dict[str, Any]:
+        return await self.call("browse", task=task)
+
     async def mark_inbox_read(self, message_id: str | None = None) -> dict[str, Any]:
         return await self.call("inbox.mark_read", **({"message_id": message_id} if message_id else {}))
 
