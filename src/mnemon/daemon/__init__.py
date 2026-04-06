@@ -28,6 +28,7 @@ import importlib
 import logging
 from typing import Any
 
+import os
 import subprocess
 
 import anyio
@@ -123,6 +124,20 @@ class JarvisDaemon:
                         self.config.webui_port,
                         self.config.socket_path,
                     )
+
+                # Start Telegram bot if token is configured
+                token = self.config.telegram_token or os.environ.get("JARVIS_TELEGRAM_TOKEN", "")
+                if token:
+                    from mnemon.daemon.channels.telegram import JarvisTelegramBot
+                    tg_bot = JarvisTelegramBot(
+                        token=token,
+                        socket_path=self.config.socket_path,
+                        state_dir=self.config.state_path,
+                        authorized_chat_id=self.config.telegram_chat_id,
+                        poll_interval_s=self.config.telegram_poll_interval_s,
+                    )
+                    tg.start_soon(tg_bot.run)
+                    logger.info("Telegram bot started — pair it by sending /start to your bot")
 
                 if self.config.webui_enabled:
                     import socket as _socket

@@ -84,6 +84,7 @@ class DaemonIPCServer:
             "approve": self._rpc_approve,
             "deny": self._rpc_deny,
             "pending": self._rpc_pending,
+            "inbox.mark_read": self._rpc_inbox_mark_read,
             "shutdown": self._rpc_shutdown,
         }
 
@@ -305,7 +306,23 @@ class DaemonIPCServer:
                 name: {"events": stats.events_observed, "last": str(stats.last_event_at)}
                 for name, stats in self._state.observer_stats.items()
             },
+            "proactive_inbox": [
+                {
+                    "id": m.id,
+                    "source_activity": m.source_activity,
+                    "content": m.content,
+                    "priority": m.priority,
+                    "read": m.read,
+                    "timestamp": str(m.timestamp),
+                }
+                for m in self._state.proactive_inbox
+            ],
         }
+
+    async def _rpc_inbox_mark_read(self, message_id: str | None = None) -> dict[str, Any]:
+        """Mark proactive inbox messages as read."""
+        count = self._state.mark_inbox_read(message_id)
+        return {"marked": count}
 
     async def _rpc_thoughts(self, limit: int = 10) -> list[dict[str, Any]]:
         """Return recent idle thinking results."""

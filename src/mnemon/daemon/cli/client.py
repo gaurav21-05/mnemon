@@ -88,5 +88,12 @@ class DaemonClient:
     async def pending(self) -> list[dict[str, Any]]:
         return await self.call("pending")
 
+    async def mark_inbox_read(self, message_id: str | None = None) -> dict[str, Any]:
+        return await self.call("inbox.mark_read", **({"message_id": message_id} if message_id else {}))
+
     async def shutdown(self) -> dict[str, Any]:
         return await self.call("shutdown")
+
+    async def _rpc(self, method: str, params: dict) -> Any:
+        """Raw RPC call — for internal use."""
+        return await self.call(method, **params)

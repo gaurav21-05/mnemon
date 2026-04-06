@@ -213,6 +213,18 @@ class DaemonConfig(BaseSettings):
         default=7777, ge=1024, le=65535,
         description="Port for the web dashboard.",
     )
+    telegram_token: str = Field(
+        default="",
+        description="Telegram bot token from @BotFather. Set via MNEMON__DAEMON__TELEGRAM_TOKEN.",
+    )
+    telegram_chat_id: int | None = Field(
+        default=None,
+        description="Authorized Telegram chat ID. Auto-saved on /start if not set.",
+    )
+    telegram_poll_interval_s: int = Field(
+        default=30, ge=10,
+        description="Seconds between proactive inbox polls for Telegram push.",
+    )
 
     idle_loop: IdleLoopConfig = Field(default_factory=IdleLoopConfig)
     observers: ObserverConfig = Field(default_factory=ObserverConfig)
