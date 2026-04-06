@@ -114,6 +114,27 @@ class JarvisDaemon:
                     self._init_git_journal()
                     tg.start_soon(self._periodic_git_commit)
 
+                # Start web UI if enabled
+                if self.config.webui_enabled:
+                    from mnemon.daemon.webui import run_webui
+                    tg.start_soon(
+                        run_webui,
+                        self.config.webui_host,
+                        self.config.webui_port,
+                        self.config.socket_path,
+                    )
+
+                if self.config.webui_enabled:
+                    import socket as _socket
+                    try:
+                        local_ip = _socket.gethostbyname(_socket.gethostname())
+                    except Exception:
+                        local_ip = "your-machine-ip"
+                    logger.info(
+                        "Web UI: http://%s:%d  ← open on phone",
+                        local_ip, self.config.webui_port,
+                    )
+
                 logger.info(
                     "Daemon fully operational — %d observers, idle loop active, "
                     "autonomy=%s",

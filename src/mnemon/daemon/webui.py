@@ -1445,20 +1445,59 @@ async def chat_handler(request: web.Request) -> web.Response:
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app() -> web.Application:
+def create_app(socket_path: Path | None = None) -> web.Application:
     app = web.Application()
+    if socket_path:
+        app["socket_path"] = socket_path
     app.router.add_get("/", lambda r: web.Response(text=HTML, content_type="text/html"))
     app.router.add_get("/events", sse_stream)
     app.router.add_post("/chat", chat_handler)
     return app
 
 
-def main() -> None:
+async def run_webui(host: str = "0.0.0.0", port: int = PORT, socket_path: Path | None = None) -> None:
+    """Start the web UI as an async task — for embedding inside the daemon."""
+    import socket as _socket
+    app = create_app(socket_path=socket_path)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+
+    # Log all local IPs so the user knows how to connect from their phone
+    try:
+        hostname = _socket.gethostname()
+        local_ip = _socket.gethostbyname(hostname)
+    except Exception:
+        local_ip = "your-machine-ip"
+
+    logger.info(
+        "Jarvis Web UI listening on http://%s:%d  (LAN: http://%s:%d)",
+        host, port, local_ip, port,
+    )
+    # Keep running until cancelled
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
+
+
+def main(host: str = "0.0.0.0", port: int = PORT) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     app = create_app()
-    print(f"Mnemon Web UI running at http://localhost:{PORT}")
-    print(f"Daemon socket: {SOCKET_PATH}")
-    web.run_app(app, host="127.0.0.1", port=PORT, access_log=None)
+
+    try:
+        import socket as _socket
+        local_ip = _socket.gethostbyname(_socket.gethostname())
+    except Exception:
+        local_ip = "your-machine-ip"
+
+    print(f"Jarvis Web UI:")
+    print(f"  Local:   http://localhost:{port}")
+    print(f"  Network: http://{local_ip}:{port}  ← open this on your phone")
+    print(f"  Socket:  {SOCKET_PATH}")
+    web.run_app(app, host=host, port=port, access_log=None)
 
 
 if __name__ == "__main__":

@@ -188,6 +188,12 @@ def cmd_approve(args: argparse.Namespace) -> None:
         print("Action not found.")
 
 
+def cmd_webui(args: argparse.Namespace) -> None:
+    """Start the web dashboard (standalone mode)."""
+    from mnemon.daemon.webui import main as webui_main
+    webui_main(host=args.host, port=args.port)
+
+
 def cmd_learn(args: argparse.Namespace) -> None:
     """Run knowledge bootstrap to seed Mnemon with foundational knowledge."""
     from mnemon.core.config import MnemonConfig
@@ -352,6 +358,12 @@ def main() -> None:
     p_approve = subparsers.add_parser("approve", help="Approve a pending action")
     p_approve.add_argument("action_id", help="Action UUID to approve")
     p_approve.set_defaults(func=cmd_approve)
+
+    # webui
+    p_webui = subparsers.add_parser("webui", help="Open the web dashboard (standalone)")
+    p_webui.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    p_webui.add_argument("--port", type=int, default=7777, help="Port (default: 7777)")
+    p_webui.set_defaults(func=cmd_webui)
 
     # learn (knowledge bootstrap)
     p_learn = subparsers.add_parser(

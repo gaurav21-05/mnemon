@@ -201,6 +201,18 @@ class DaemonConfig(BaseSettings):
         default=600, ge=60,
         description="Seconds between automatic git commits of the state directory.",
     )
+    webui_enabled: bool = Field(
+        default=True,
+        description="Serve the web dashboard (chat + stats) on the local network.",
+    )
+    webui_host: str = Field(
+        default="0.0.0.0",
+        description="Host to bind the web UI — 0.0.0.0 makes it reachable on LAN (e.g. from phone).",
+    )
+    webui_port: int = Field(
+        default=7777, ge=1024, le=65535,
+        description="Port for the web dashboard.",
+    )
 
     idle_loop: IdleLoopConfig = Field(default_factory=IdleLoopConfig)
     observers: ObserverConfig = Field(default_factory=ObserverConfig)
