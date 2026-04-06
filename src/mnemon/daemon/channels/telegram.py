@@ -47,9 +47,10 @@ HELP_TEXT = """\
 /soul — Read Jarvis's soul file
 /master — What Jarvis knows about you
 /browse <query> — Browse the web for something
+/clear — Clear this conversation's chat history
 /help — This message
 
-Or just send any message to chat (Jarvis auto-browses when relevant).
+Or just send any message to chat.
 """
 
 
@@ -104,6 +105,7 @@ class JarvisTelegramBot:
         self._app.add_handler(CommandHandler("master", self._cmd_master))
         self._app.add_handler(CommandHandler("help", self._cmd_help))
         self._app.add_handler(CommandHandler("browse", self._cmd_browse))
+        self._app.add_handler(CommandHandler("clear", self._cmd_clear))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
         )
@@ -287,6 +289,17 @@ class JarvisTelegramBot:
             return
         content = soul_path.read_text()[:3000]
         await update.message.reply_text(f"```\n{content}\n```", parse_mode="Markdown")
+
+    async def _cmd_clear(self, update, context) -> None:
+        if not self._is_authorized(update):
+            return
+        try:
+            from mnemon.daemon.cli.client import DaemonClient
+            client = DaemonClient(self._socket_path)
+            await client.call("chat.clear")
+            await update.message.reply_text("🧹 Conversation history cleared.")
+        except Exception as exc:
+            await update.message.reply_text(f"Clear failed: {exc}")
 
     async def _cmd_browse(self, update, context) -> None:
         if not self._is_authorized(update):

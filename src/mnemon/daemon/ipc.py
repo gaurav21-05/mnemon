@@ -91,6 +91,7 @@ class DaemonIPCServer:
             "pending": self._rpc_pending,
             "inbox.mark_read": self._rpc_inbox_mark_read,
             "browse": self._rpc_browse,
+            "chat.clear": self._rpc_chat_clear,
             "shutdown": self._rpc_shutdown,
         }
 
@@ -362,6 +363,12 @@ class DaemonIPCServer:
                 for m in self._state.proactive_inbox
             ],
         }
+
+    async def _rpc_chat_clear(self) -> dict[str, Any]:
+        """Clear the in-memory conversation history for a fresh start."""
+        self._chat_history.clear()
+        logger.info("Chat history cleared.")
+        return {"cleared": True}
 
     async def _rpc_inbox_mark_read(self, message_id: str | None = None) -> dict[str, Any]:
         """Mark proactive inbox messages as read."""

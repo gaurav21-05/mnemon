@@ -51,6 +51,9 @@ class DaemonProcess:
             If True, run in the current terminal (for development/systemd).
             If False, fork into background as a true daemon.
         """
+        # Load ~/.mnemon/.env before anything else so tokens are available
+        self._load_env_file()
+
         # Ensure only one daemon instance runs at a time
         existing = self.status()
         if existing.get("running"):
@@ -137,8 +140,14 @@ class DaemonProcess:
     async def _run(self) -> None:
         """Main async loop: build brain, start all subsystems, await shutdown."""
         from mnemon.daemon import DaemonFactory
+        from mnemon.daemon.config import DaemonConfig
 
-        factory = DaemonFactory(self._daemon_config, self._mnemon_config)
+        # Re-read config now that .env is loaded into os.environ
+        # (pydantic-settings reads env vars at construction time, so we
+        # must construct *after* _load_env_file has populated os.environ)
+        daemon_config = DaemonConfig()
+
+        factory = DaemonFactory(daemon_config, self._mnemon_config)
         daemon = await factory.build()
 
         try:
@@ -181,6 +190,25 @@ class DaemonProcess:
         pid_path = self._daemon_config.pid_path
         pid_path.unlink(missing_ok=True)
         logger.debug("PID file removed: %s", pid_path)
+
+    def _load_env_file(self) -> None:
+        """Load ~/.mnemon/.env into os.environ if it exists."""
+        env_path = Path("~/.mnemon/.env").expanduser()
+        if not env_path.exists():
+            return
+        try:
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+            logger.debug("Loaded env from ~/.mnemon/.env")
+        except Exception as exc:
+            logger.warning("Failed to load ~/.mnemon/.env: %s", exc)
 
     def _setup_signals(self) -> None:
         """Register signal handlers for graceful shutdown."""
