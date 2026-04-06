@@ -71,6 +71,9 @@ class IdleThinkingLoop:
         # Track recently used episode IDs per activity to avoid repetition
         self._reflected_episode_ids: set[str] = set()
         self._master_episode_ids: set[str] = set()
+        # Rate limit proactive pushes — max 1 per 10 minutes
+        self._last_proactive_push: float = 0.0
+        self._min_push_interval_s: float = 600.0
 
     @property
     def is_running(self) -> bool:
@@ -357,6 +360,10 @@ class IdleThinkingLoop:
             if not episodes:
                 return {"summary": "No conversations yet — I can't know my master without talking to them."}
 
+            # Need enough real data to avoid hallucination — min 3 episodes
+            if len(episodes) < 3:
+                return {"summary": "Not enough conversations yet to form reliable observations about the master."}
+
             # Avoid re-reflecting on the same episodes
             available = [e for e in episodes if str(e.id) not in self._master_episode_ids]
             if not available:
@@ -375,13 +382,13 @@ class IdleThinkingLoop:
 
             if mode == "observe":
                 prompt = (
-                    "You are Jarvis, trying to deeply understand your master.\n\n"
-                    f"Recent conversations:\n{conv_context}\n\n"
-                    f"What you already know about them:\n{current_profile[:400]}\n\n"
-                    "What's one specific, non-obvious thing you can observe about this person from "
-                    "these conversations? Think about: their priorities, how they think, what they "
-                    "care about, what frustrates or motivates them. "
-                    "Be precise — not 'they seem motivated' but WHY and HOW specifically. 2-3 sentences."
+                    "You are Jarvis, trying to understand your master based ONLY on what they have actually said.\n\n"
+                    f"What they have explicitly said in conversations:\n{conv_context}\n\n"
+                    f"What you already noted about them:\n{current_profile[:400]}\n\n"
+                    "Based STRICTLY on the above — no guessing, no extrapolating — what is one specific "
+                    "thing you can observe about this person? Only reference things they literally said. "
+                    "If the conversations are too sparse to draw a solid conclusion, say so. "
+                    "Never invent habits, routines, or feelings they haven't expressed. 1-2 sentences."
                 )
                 section = "Patterns I've Noticed"
 
@@ -609,7 +616,8 @@ class IdleThinkingLoop:
         Consolidation and exploration are silent internal housekeeping.
         """
         activity = result.get("activity", "")
-        if activity not in ("help_master", "know_master", "grow"):
+        # grow = internal self-reflection, not for the user's feed
+        if activity not in ("help_master", "know_master"):
             return
 
         summary = result.get("summary", "").strip()
@@ -618,9 +626,15 @@ class IdleThinkingLoop:
 
         skip_patterns = (
             "failed", "no conversations", "no goals", "waiting for master",
-            "can't know", "nothing yet",
+            "can't know", "nothing yet", "no new episodes",
         )
         if any(p in summary.lower() for p in skip_patterns):
+            return
+
+        # Rate limit: at most one proactive push every 10 minutes
+        now = time.monotonic()
+        if now - self._last_proactive_push < self._min_push_interval_s:
+            logger.debug("Proactive push rate-limited — skipping.")
             return
 
         try:
@@ -667,6 +681,7 @@ class IdleThinkingLoop:
                 priority=priority,
             )
             self._state.add_proactive_message(proactive_msg)
+            self._last_proactive_push = time.monotonic()
             logger.info(
                 "Proactive message queued [%s]: %s",
                 activity,
