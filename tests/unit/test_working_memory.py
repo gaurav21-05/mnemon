@@ -342,3 +342,52 @@ async def test_inject_retrieved_sorts_by_score_descending() -> None:
     # should reflect descending score (high first)
     contents = [b.content for b in state.active_context]
     assert contents.index("high score") < contents.index("low score")
+
+
+# ---------------------------------------------------------------------------
+# flush() — source filtering
+# ---------------------------------------------------------------------------
+
+
+async def test_flush_excludes_retrieval_blocks_from_context() -> None:
+    """Retrieval-sourced blocks must NOT pollute the episode context."""
+    mgr = _make_manager(budget=500)
+    user_block = ContextBlock(
+        content="user said hello",
+        token_count=5,
+        source=ContextSource.USER_INPUT,
+        importance=0.5,
+    )
+    await mgr.inject(user_block)
+    retrieval_block = ContextBlock(
+        content="old retrieved memory should not pollute context",
+        token_count=10,
+        source=ContextSource.RETRIEVAL,
+        importance=0.7,
+    )
+    await mgr.inject(retrieval_block)
+    episode = await mgr.flush()
+    assert "user said hello" in episode.context
+    assert "old retrieved memory should not pollute context" not in episode.context
+
+
+async def test_flush_excludes_summary_blocks_from_context() -> None:
+    """Summary blocks must NOT pollute the episode context."""
+    mgr = _make_manager(budget=500)
+    user_block = ContextBlock(
+        content="actual user input",
+        token_count=5,
+        source=ContextSource.USER_INPUT,
+        importance=0.5,
+    )
+    summary_block = ContextBlock(
+        content="summarised old stuff that should stay out",
+        token_count=8,
+        source=ContextSource.SUMMARY,
+        importance=0.3,
+    )
+    await mgr.inject(user_block)
+    await mgr.inject(summary_block)
+    episode = await mgr.flush()
+    assert "actual user input" in episode.context
+    assert "summarised old stuff" not in episode.context

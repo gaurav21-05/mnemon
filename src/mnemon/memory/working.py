@@ -264,8 +264,11 @@ class WorkingMemoryManager(WorkingMemoryInterface):
         working memory layer has no knowledge of what the agent did or
         observed — the caller is expected to enrich the episode afterwards.
         """
+        _EXCLUDED = {ContextSource.RETRIEVAL, ContextSource.SUMMARY}
         context_text = "\n\n".join(
-            b.content for b in self._state.active_context
+            b.content
+            for b in self._state.active_context
+            if b.source not in _EXCLUDED
         )
         episode = Episode(
             agent_id="mnemon",
