@@ -122,6 +122,7 @@ class Orchestrator(OrchestratorInterface):
         action_result: dict[str, Any] = {}
         meta_eval = None
         wm_state = None
+        self._last_episode_id = None
 
         logger.info(
             "Cycle %d started (cycle_id=%s, has_input=%s).",
@@ -462,8 +463,7 @@ class Orchestrator(OrchestratorInterface):
         episode = await self._episodic.get(self._last_episode_id)
         if episode is None:
             return
-        updated = episode.model_copy(update={"outcome": outcome})
-        await self._episodic.encode(updated)
+        await self._episodic.update(episode.id, outcome=outcome)
         logger.debug(
             "Updated outcome for episode %s (len=%d)",
             self._last_episode_id,

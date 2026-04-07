@@ -236,7 +236,7 @@ class DaemonIPCServer:
             try:
                 await self._brain.orchestrator.update_last_episode_outcome(reply)
             except Exception:
-                logger.debug("Could not update episode outcome", exc_info=True)
+                logger.warning("Could not update episode outcome", exc_info=True)
 
             # Update conversation history
             self._chat_history.append({"role": "user", "content": message})
