@@ -92,6 +92,7 @@ class Orchestrator(OrchestratorInterface):
         self._embedding_provider = embedding_provider
         self._bus = bus
         self._cycle_count: int = 0
+        self._last_episode_id: UUID | None = None
 
     # ------------------------------------------------------------------
     # OrchestratorInterface implementation
@@ -170,12 +171,15 @@ class Orchestrator(OrchestratorInterface):
                     load,
                 )
 
-                if gate_decision == GateDecision.BROADCAST:
+                # Always inject explicit user input — user messages must never be
+                # silently dropped by the attention gate, as they form the core
+                # episodic memory of conversations.
+                if raw_input or gate_decision == GateDecision.BROADCAST:
                     block = ContextBlock(
                         content=percept.normalized,
                         token_count=percept.tokens,
                         source=ContextSource.USER_INPUT,
-                        importance=salience.combined,
+                        importance=max(salience.combined, 0.5),  # floor for user input
                     )
                     await self._working_memory.inject(block)
                 elif gate_decision == GateDecision.QUEUE:
@@ -375,6 +379,11 @@ class Orchestrator(OrchestratorInterface):
             # Flush working memory to create an episode
             episode = await self._working_memory.flush()
 
+            # Store raw_input as action if episode action is empty
+            # This ensures user messages are captured even when execution is a placeholder
+            if raw_input and not episode.action:
+                episode = episode.model_copy(update={"action": raw_input})
+
             # Compute reward (simple heuristic: use episode importance as proxy)
             predicted_value = 0.5
             actual_reward = episode.importance
@@ -394,6 +403,7 @@ class Orchestrator(OrchestratorInterface):
 
             # Encode episode to episodic memory
             await self._episodic.encode(episode_with_reward)
+            self._last_episode_id = episode_with_reward.id
 
             # Update valence associations
             if percept is not None:
@@ -440,6 +450,25 @@ class Orchestrator(OrchestratorInterface):
                 else None
             ),
         }
+
+    async def update_last_episode_outcome(self, outcome: str) -> None:
+        """Patch the outcome field of the most recently encoded episode.
+
+        Called by the IPC layer after the LLM reply is generated, so that
+        the stored episode reflects what Jarvis actually said.
+        """
+        if self._last_episode_id is None:
+            return
+        episode = await self._episodic.get(self._last_episode_id)
+        if episode is None:
+            return
+        updated = episode.model_copy(update={"outcome": outcome})
+        await self._episodic.encode(updated)
+        logger.debug(
+            "Updated outcome for episode %s (len=%d)",
+            self._last_episode_id,
+            len(outcome),
+        )
 
     async def run_until_complete(
         self,
