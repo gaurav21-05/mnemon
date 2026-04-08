@@ -7,6 +7,7 @@ Usage:
     mnemon-daemon status                  Check daemon status
     mnemon-daemon chat "message"          Send a message (one-shot)
     mnemon-daemon chat                    Interactive REPL
+    mnemon-daemon improve [goal]          Run supervised self-improvement
     mnemon-daemon thoughts [--limit N]    View recent idle thinking
     mnemon-daemon goals add "desc"        Add a new goal
     mnemon-daemon goals list              List active goals
@@ -18,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 import anyio
 
@@ -46,7 +46,7 @@ def cmd_start(args: argparse.Namespace) -> None:
 
     process = DaemonProcess(daemon_config, mnemon_config)
 
-    print(f"Starting Mnemon daemon...")
+    print("Starting Mnemon daemon...")
     print(f"  PID file: {daemon_config.pid_path}")
     print(f"  Log file: {daemon_config.log_path}")
     print(f"  Socket:   {daemon_config.socket_path}")
@@ -176,6 +176,67 @@ def cmd_pending(args: argparse.Namespace) -> None:
     for a in pending:
         print(f"  [{a['risk']}] {a['description']}")
         print(f"        id={a['id']} source={a['source']}")
+
+
+def cmd_improve(args: argparse.Namespace) -> None:
+    """Run a supervised self-improvement cycle."""
+    client = _get_client()
+
+    if args.analyze:
+        result = anyio.run(client.improve_analyze)
+        print("\n=== Analysis ===")
+        print(result.get("summary", "(no summary)"))
+        print()
+        print("Git status:", result.get("git_status", "(clean)") or "(clean)")
+        return
+
+    if args.abort:
+        result = anyio.run(client.improve_abort)
+        print("Aborted." if result.get("ok") else f"Error: {result.get('error')}")
+        return
+
+    if args.approve:
+        result = anyio.run(client.improve_approve)
+        if result.get("ok"):
+            print(f"Merged branch '{result.get('branch')}' into HEAD.")
+            print(f"Summary: {result.get('summary')}")
+        else:
+            print(f"Error: {result.get('error')}")
+        return
+
+    goal = args.goal or "improve code quality and fix any failing tests"
+    result = anyio.run(client.improve_start, goal)
+    if result.get("started"):
+        print(f"Starting self-improvement session: {goal}")
+        print("Run 'mnemon-daemon improve --status' to poll progress.")
+    else:
+        print(f"Error: {result.get('error', 'could not start session')}")
+
+
+def cmd_improve_status(args: argparse.Namespace) -> None:
+    """Show the current self-improvement session status."""
+    client = _get_client()
+    result = anyio.run(client.improve_status)
+    phase = result.get("phase", "idle")
+    print(f"Phase: {phase}")
+    if result.get("analysis_summary"):
+        print(f"Analysis: {result['analysis_summary']}")
+    if result.get("plan_summary"):
+        print(f"Plan: {result['plan_summary']}")
+    steps_total = result.get("patch_steps_total", 0)
+    steps_done = result.get("steps_applied", 0)
+    if steps_total:
+        print(f"Patches: {steps_done}/{steps_total} applied")
+    if result.get("verify_output"):
+        print(f"Verify: {'PASS' if result.get('verify_passed') else 'FAIL'}")
+        print(result["verify_output"][:800])
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+    if phase == "awaiting_approval":
+        approval_id = result.get("approval_id")
+        print(f"\nReady for approval (id={approval_id})")
+        print("  mnemon-daemon improve --approve    # merge and clean up")
+        print("  mnemon-daemon improve --abort      # discard changes")
 
 
 def cmd_browse(args: argparse.Namespace) -> None:
@@ -322,7 +383,11 @@ def cmd_learn(args: argparse.Namespace) -> None:
     """Run knowledge bootstrap to seed Mnemon with foundational knowledge."""
     from mnemon.core.config import MnemonConfig
     from mnemon.factory import MnemonFactory
-    from mnemon.learning.bootstrap import KnowledgeBootstrap, FOUNDATION_TOPICS, FOUNDATION_CONCEPTS
+    from mnemon.learning.bootstrap import (
+        FOUNDATION_CONCEPTS,
+        FOUNDATION_TOPICS,
+        KnowledgeBootstrap,
+    )
 
     print("Mnemon Knowledge Bootstrap")
     print("=" * 50)
@@ -356,7 +421,7 @@ def cmd_learn(args: argparse.Namespace) -> None:
             results = await bootstrap.run(phases=phases, on_progress=_progress)
 
         print()
-        print(f"Bootstrap complete:")
+        print("Bootstrap complete:")
         print(f"  Wikipedia articles encoded: {results['wikipedia_articles']}")
         print(f"  ConceptNet triples written:  {results['conceptnet_triples']}")
         print()
@@ -440,7 +505,9 @@ def _handle_repl_command(client, cmd: str) -> None:
             else:
                 result = anyio.run(client.write_file, write_parts[0], write_parts[1], False)
                 print(
-                    f"  Wrote {result.get('bytes_written', 0)} bytes to {result.get('path', write_parts[0])}"
+                    "  Wrote "
+                    f"{result.get('bytes_written', 0)} bytes to "
+                    f"{result.get('path', write_parts[0])}"
                 )
         elif command == "/exec":
             raw_command = cmd[len("/exec"):].strip()
@@ -530,7 +597,12 @@ def main() -> None:
     # write
     p_write = subparsers.add_parser("write", help="Write a file in the daemon workspace")
     p_write.add_argument("path", help="File path")
-    p_write.add_argument("content", nargs="?", default=None, help="Content to write (omit to read from stdin)")
+    p_write.add_argument(
+        "content",
+        nargs="?",
+        default=None,
+        help="Content to write (omit to read from stdin)",
+    )
     p_write.add_argument("--append", action="store_true", help="Append instead of overwrite")
     p_write.set_defaults(func=cmd_write)
 
@@ -551,10 +623,22 @@ def main() -> None:
     p_patch.set_defaults(func=cmd_patch)
 
     # verify
-    p_verify = subparsers.add_parser("verify", help="Run verification commands in the daemon workspace")
+    p_verify = subparsers.add_parser(
+        "verify",
+        help="Run verification commands in the daemon workspace",
+    )
     p_verify.add_argument("command", nargs="+", help="One or more commands to run sequentially")
-    p_verify.add_argument("--cwd", default=None, help="Working directory relative to workspace root")
-    p_verify.add_argument("--timeout", type=float, default=120.0, help="Timeout per command in seconds")
+    p_verify.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory relative to workspace root",
+    )
+    p_verify.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Timeout per command in seconds",
+    )
     p_verify.set_defaults(func=cmd_verify)
 
     # diff
@@ -563,8 +647,15 @@ def main() -> None:
     p_diff.set_defaults(func=cmd_diff)
 
     # git-status
-    p_git_status = subparsers.add_parser("git-status", help="Show git status in the daemon workspace")
-    p_git_status.add_argument("--cwd", default=None, help="Working directory relative to workspace root")
+    p_git_status = subparsers.add_parser(
+        "git-status",
+        help="Show git status in the daemon workspace",
+    )
+    p_git_status.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory relative to workspace root",
+    )
     p_git_status.set_defaults(func=cmd_git_status)
 
     # worktree
@@ -607,6 +698,18 @@ def main() -> None:
     p_approve = subparsers.add_parser("approve", help="Approve a pending action")
     p_approve.add_argument("action_id", help="Action UUID to approve")
     p_approve.set_defaults(func=cmd_approve)
+
+    # improve
+    p_improve = subparsers.add_parser(
+        "improve",
+        help="Run a supervised self-improvement cycle",
+    )
+    p_improve.add_argument("goal", nargs="?", help="Improvement goal description")
+    p_improve.add_argument("--analyze", action="store_true", help="Analyze only, don't start")
+    p_improve.add_argument("--status", action="store_true", help="Show current session status")
+    p_improve.add_argument("--approve", action="store_true", help="Approve pending improvement")
+    p_improve.add_argument("--abort", action="store_true", help="Abort current session")
+    p_improve.set_defaults(func=lambda a: cmd_improve_status(a) if a.status else cmd_improve(a))
 
     # webui
     p_webui = subparsers.add_parser("webui", help="Open the web dashboard (standalone)")

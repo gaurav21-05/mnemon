@@ -11,12 +11,14 @@ Protocol: Newline-delimited JSON-RPC 2.0 over a Unix domain socket.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from collections import deque
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import anyio
@@ -25,7 +27,10 @@ from anyio import create_unix_listener
 
 from mnemon.daemon.autonomy import AutonomyController, ProposedAction
 from mnemon.daemon.config import RiskLevel
-from mnemon.daemon.state import DaemonState
+from mnemon.daemon.improve import Phase, SelfImprovementOrchestrator
+
+if TYPE_CHECKING:
+    from mnemon.daemon.state import DaemonState
 
 logger = logging.getLogger(__name__)
 
@@ -392,10 +397,13 @@ Do NOT say things like "you mentioned before", "in our previous conversations", 
 there is no prior history. If they ask if you know them, say honestly that you don't yet.
 
 HARD RULES — never break these:
-- You can browse the web and use local workspace tools when the user's request clearly calls for them.
-  Available tool-equivalent commands are: browse web, list files, read files, write files, and run local commands.
+- You can browse the web and use local workspace tools when the user's request
+  clearly calls for them.
+  Available tool-equivalent commands are: browse web, list files, read files,
+  write files, and run local commands.
   If you use a tool, only claim what the tool actually returned.
-- NEVER invent facts about the user. Do not assume routines, habits, or feelings they haven't stated.
+- NEVER invent facts about the user. Do not assume routines, habits, or
+  feelings they haven't stated.
 - NEVER pretend you've done something you haven't.
 - Ask ONE follow-up question at most. Never fire a list of questions.
 - Keep replies concise. No filler phrases like "Great question!" or "Certainly!".\
@@ -408,8 +416,10 @@ You know the following about this person (from past conversations):
 {memories}
 
 HARD RULES — never break these:
-- You can browse the web and use local workspace tools when the user's request clearly calls for them.
-  Available tool-equivalent commands are: browse web, list files, read files, write files, and run local commands.
+- You can browse the web and use local workspace tools when the user's request
+  clearly calls for them.
+  Available tool-equivalent commands are: browse web, list files, read files,
+  write files, and run local commands.
   If you use a tool, only claim what the tool actually returned.
 - NEVER invent observations about the user beyond what's explicitly in the memories above.
   Do not fabricate routines, habits, moods, or behaviors they haven't stated.
@@ -442,17 +452,25 @@ class DaemonIPCServer:
         self._browser: Any = None
         self._workspace: Any = None
         self._pending_tool_actions: dict[UUID, dict[str, Any]] = {}
+        self._improver: SelfImprovementOrchestrator | None = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self._handlers: dict[str, Any] = {
             "chat": self._rpc_chat,
             "status": self._rpc_status,
             "thoughts": self._rpc_thoughts,
             "goals.list": self._rpc_goals_list,
             "goals.add": self._rpc_goals_add,
+            "improve.analyze": self._rpc_improve_analyze,
+            "improve.start": self._rpc_improve_start,
+            "improve.status": self._rpc_improve_status,
+            "improve.approve": self._rpc_improve_approve,
+            "improve.abort": self._rpc_improve_abort,
             "approve": self._rpc_approve,
             "deny": self._rpc_deny,
             "pending": self._rpc_pending,
             "inbox.mark_read": self._rpc_inbox_mark_read,
             "browse": self._rpc_browse,
+            "memory.search": self._rpc_memory_search,
             "workspace.list": self._rpc_workspace_list,
             "workspace.read": self._rpc_workspace_read,
             "workspace.write": self._rpc_workspace_write,
@@ -483,10 +501,8 @@ class DaemonIPCServer:
         """Stop accepting connections."""
         self._running = False
         if self._socket_path.exists():
-            try:
+            with suppress(OSError):
                 self._socket_path.unlink()
-            except OSError:
-                pass
         logger.info("IPC server stopped.")
 
     async def _serve(self) -> None:
@@ -543,10 +559,8 @@ class DaemonIPCServer:
                         "error": {"code": -32000, "message": str(exc)},
                     }
 
-            try:
+            with suppress(Exception):
                 await stream.send(json.dumps(response).encode("utf-8"))
-            except Exception:
-                pass  # Client disconnected before we could reply — not an error
 
         except (anyio.BrokenResourceError, anyio.EndOfStream):
             pass  # Client disconnected mid-request
@@ -556,6 +570,95 @@ class DaemonIPCServer:
     # ------------------------------------------------------------------
     # RPC handlers
     # ------------------------------------------------------------------
+
+    def _get_improver(self) -> SelfImprovementOrchestrator:
+        if self._improver is None:
+            try:
+                llm = self._brain.control.goals._llm
+            except Exception as exc:
+                raise RuntimeError("LLM not available") from exc
+            self._improver = SelfImprovementOrchestrator(
+                workspace=self._get_workspace(),
+                llm=llm,
+            )
+        return self._improver
+
+    async def _rpc_improve_analyze(self) -> dict[str, Any]:
+        improver = self._get_improver()
+        return await improver.analyze()
+
+    async def _rpc_improve_start(
+        self,
+        goal: str = "improve code quality",
+    ) -> dict[str, Any]:
+        improver = self._get_improver()
+        session = improver.session
+        if session is not None and session.phase not in {
+            Phase.DONE,
+            Phase.ABORTED,
+            Phase.FAILED,
+        }:
+            return {
+                "started": False,
+                "error": "A self-improvement session is already running",
+                "phase": str(session.phase),
+            }
+
+        async def _run() -> None:
+            try:
+                await improver.run(goal)
+            except Exception:
+                logger.exception("Self-improvement session failed")
+
+        task = asyncio.create_task(_run())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return {"started": True, "goal": goal}
+
+    async def _rpc_improve_status(self) -> dict[str, Any]:
+        if self._improver is None:
+            return {"phase": "idle", "session_id": None}
+        return self._improver.status()
+
+    async def _rpc_improve_approve(self) -> dict[str, Any]:
+        if self._improver is None:
+            return {"ok": False, "error": "no session awaiting approval"}
+        return await self._improver.approve()
+
+    async def _rpc_improve_abort(self) -> dict[str, Any]:
+        if self._improver is None:
+            return {"ok": False, "error": "no active session to abort"}
+        return await self._improver.abort()
+
+    async def _rpc_memory_search(
+        self,
+        query: str = "",
+        top_k: int = 10,
+    ) -> dict[str, Any]:
+        if not query.strip():
+            return {"query": "", "results": []}
+
+        try:
+            from mnemon.core.models import RetrievalQuery
+
+            retrieval = await self._brain.memory.episodic.retrieve(
+                RetrievalQuery(query_text=query, top_k=max(1, top_k))
+            )
+            return {
+                "query": query,
+                "results": [
+                    {
+                        "content": item.content,
+                        "score": item.score,
+                        "source": item.source_store,
+                        "metadata": item.metadata,
+                    }
+                    for item in retrieval.items
+                ],
+            }
+        except Exception as exc:
+            logger.warning("memory.search failed: %s", exc)
+            return {"query": query, "results": [], "error": str(exc)}
 
     async def _rpc_chat(self, message: str = "") -> dict[str, Any]:
         """User sends a message -> run cognitive cycle -> generate reply -> return."""
@@ -694,15 +797,18 @@ class DaemonIPCServer:
             # Inject live browsing results if we did a browse
             if browse_result:
                 system += (
-                    f"\n\nYou just browsed the web for the user's request. Here is what you found:\n"
+                    "\n\nYou just browsed the web for the user's request. "
+                    "Here is what you found:\n"
                     f"{browse_result[:3000]}\n\n"
-                    "Use this to answer the user's question. Be specific and reference actual findings."
+                    "Use this to answer the user's question. "
+                    "Be specific and reference actual findings."
                 )
 
             if pending_curiosity:
                 system += (
                     f"\n\nYou've been thinking about asking: \"{pending_curiosity}\""
-                    "\nOnly ask it if it fits naturally at the end of your reply — skip it if the topic is unrelated."
+                    "\nOnly ask it if it fits naturally at the end of your reply — "
+                    "skip it if the topic is unrelated."
                 )
 
             history = list(self._chat_history)
@@ -726,7 +832,11 @@ class DaemonIPCServer:
             browse_hint = {"action": "browse", "task": message}
 
         inferred = _infer_workspace_intent(message)
-        initial_action = browse_hint or self._step_to_action(inferred) if inferred or browse_hint else None
+        initial_action = (
+            browse_hint or self._step_to_action(inferred)
+            if inferred or browse_hint
+            else None
+        )
         if initial_action is None and not _looks_like_agentic_tool_request(message):
             return None
         return await self._run_agentic_tool_loop(

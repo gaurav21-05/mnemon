@@ -21,8 +21,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import sys
 from pathlib import Path
 
 from aiohttp import web
@@ -67,7 +65,10 @@ HTML = """<!DOCTYPE html>
     --pomegranate-400: #fc7981;
     --blueberry-800: #01418d;
     --focus: rgb(20, 110, 245);
-    --clay-shadow: rgba(0, 0, 0, 0.1) 0 1px 1px, rgba(0, 0, 0, 0.04) 0 -1px 1px inset, rgba(0, 0, 0, 0.05) 0 -0.5px 1px;
+    --clay-shadow:
+      rgba(0, 0, 0, 0.1) 0 1px 1px,
+      rgba(0, 0, 0, 0.04) 0 -1px 1px inset,
+      rgba(0, 0, 0, 0.05) 0 -0.5px 1px;
     --hard-shadow: rgb(0, 0, 0) -7px 7px 0;
     --font-sans: "Roobert", "Avenir Next", "Trebuchet MS", Arial, sans-serif;
     --font-mono: "Space Mono", "SFMono-Regular", Consolas, monospace;
@@ -177,6 +178,37 @@ HTML = """<!DOCTYPE html>
     gap: 12px;
     flex: 1;
     min-width: 0;
+  }
+
+  .memory-search {
+    position: relative;
+    flex: 0 0 280px;
+    min-width: 220px;
+  }
+
+  .memory-search-input {
+    min-height: 40px;
+    padding-right: 42px;
+    font-size: 13px;
+  }
+
+  .memory-search-results {
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 0;
+    right: 0;
+    z-index: 20;
+    display: none;
+    max-height: 260px;
+    overflow-y: auto;
+    border: 1px solid var(--oat);
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.96);
+    box-shadow: var(--clay-shadow);
+  }
+
+  .memory-search-results.show {
+    display: block;
   }
 
   .nav-stats {
@@ -753,7 +785,12 @@ HTML = """<!DOCTYPE html>
     letter-spacing: -0.01em;
     cursor: pointer;
     box-shadow: var(--clay-shadow);
-    transition: transform 0.18s ease, box-shadow 0.18s ease, background-color 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+    transition:
+      transform 0.18s ease,
+      box-shadow 0.18s ease,
+      background-color 0.18s ease,
+      color 0.18s ease,
+      border-color 0.18s ease;
   }
 
   .cta-button:hover,
@@ -813,6 +850,43 @@ HTML = """<!DOCTYPE html>
     background: transparent;
     color: rgba(255, 255, 255, 0.72);
     border-color: rgba(255, 255, 255, 0.16);
+  }
+
+  .goal-form {
+    display: flex;
+    gap: 10px;
+    padding: 0 18px 18px;
+    align-items: stretch;
+    flex-shrink: 0;
+  }
+
+  .goal-form .chat-input {
+    min-height: 40px;
+  }
+
+  .search-result {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--oat-light);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .search-result:last-child {
+    border-bottom: none;
+  }
+
+  .search-result .search-text {
+    color: var(--ink);
+  }
+
+  .search-score {
+    display: inline-block;
+    min-width: 40px;
+    margin-right: 6px;
+    color: var(--matcha-600);
+    font-size: 11px;
+    font-weight: 700;
+    font-family: var(--font-mono);
   }
 
   @media (max-width: 1180px) {
@@ -887,6 +961,12 @@ HTML = """<!DOCTYPE html>
       align-items: stretch;
     }
 
+    .memory-search {
+      flex: 1 1 auto;
+      width: 100%;
+      min-width: 0;
+    }
+
     .nav-stats {
       width: 100%;
     }
@@ -900,6 +980,10 @@ HTML = """<!DOCTYPE html>
     }
 
     .chat-input-row {
+      flex-direction: column;
+    }
+
+    .goal-form {
       flex-direction: column;
     }
 
@@ -937,6 +1021,16 @@ HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div class="topbar-meta">
+      <div class="memory-search">
+        <input
+          class="chat-input memory-search-input"
+          id="memSearchInput"
+          type="text"
+          placeholder="Search memory…"
+          autocomplete="off"
+        />
+        <div class="memory-search-results" id="memSearchResults"></div>
+      </div>
       <div class="nav-stats">
         <div class="nav-stat">
           <span class="nav-stat-label">Uptime</span>
@@ -967,7 +1061,9 @@ HTML = """<!DOCTYPE html>
 </header>
 
 <main class="page">
-  <div class="offline-banner" id="offlineBanner">Daemon offline. The dashboard is retrying the event stream.</div>
+  <div class="offline-banner" id="offlineBanner">
+    Daemon offline. The dashboard is retrying the event stream.
+  </div>
 
   <section class="dashboard-grid">
     <article class="panel-shell thoughts-shell" id="thoughtsSection">
@@ -988,6 +1084,16 @@ HTML = """<!DOCTYPE html>
       <div class="panel-body" id="goalsPanel">
         <div class="empty">No active goals.</div>
       </div>
+      <form class="goal-form" id="goalForm">
+        <input
+          class="chat-input"
+          id="goalInput"
+          type="text"
+          placeholder="Add a new goal…"
+          autocomplete="off"
+        />
+        <button class="send-btn" id="goalSubmitBtn" type="submit" disabled>Add</button>
+      </form>
     </article>
 
     <article class="panel-shell log-shell">
@@ -1008,7 +1114,13 @@ HTML = """<!DOCTYPE html>
         <div class="empty">Say something to Jarvis when the daemon comes online.</div>
       </div>
       <div class="chat-input-row" id="chatComposer">
-        <input class="chat-input" id="chatInput" type="text" placeholder="Ask Jarvis anything…" autocomplete="off" />
+        <input
+          class="chat-input"
+          id="chatInput"
+          type="text"
+          placeholder="Ask Jarvis anything…"
+          autocomplete="off"
+        />
         <button class="send-btn" id="sendBtn" disabled>Send message</button>
       </div>
     </article>
@@ -1064,6 +1176,7 @@ function setOnline(v) {
   $('statusLabel').textContent = v ? 'online and streaming' : 'reconnecting';
   $('offlineBanner').className = 'offline-banner' + (v ? '' : ' show');
   $('sendBtn').disabled = !v;
+  if ($('goalSubmitBtn')) $('goalSubmitBtn').disabled = !v;
 }
 
 function renderStatus(s) {
@@ -1143,6 +1256,107 @@ function renderGoals(goals) {
   setPanelHTML($('goalsPanel'), topLevel.map(renderGoal).join(''));
 }
 
+const goalForm = $('goalForm');
+const goalInput = $('goalInput');
+const goalSubmitBtn = $('goalSubmitBtn');
+
+if (goalForm && goalInput && goalSubmitBtn) {
+  goalForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const description = goalInput.value.trim();
+    if (!description || !online) return;
+
+    goalInput.disabled = true;
+    goalSubmitBtn.disabled = true;
+
+    try {
+      const response = await fetch('/api/goals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description, priority: 0.5 }),
+      });
+      const data = await response.json();
+      if (response.ok && !data.error) {
+        goalInput.value = '';
+      }
+    } catch (error) {
+      console.error('goal create failed', error);
+    } finally {
+      goalInput.disabled = false;
+      goalSubmitBtn.disabled = !online;
+      goalInput.focus();
+    }
+  });
+}
+
+const memSearchInput = $('memSearchInput');
+const memSearchResults = $('memSearchResults');
+let memSearchTimer = null;
+
+if (memSearchInput && memSearchResults) {
+  memSearchInput.addEventListener('input', () => {
+    clearTimeout(memSearchTimer);
+    memSearchTimer = setTimeout(runMemorySearch, 250);
+  });
+
+  memSearchInput.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      memSearchInput.value = '';
+      setMemorySearchResults([]);
+    }
+  });
+
+  document.addEventListener('click', event => {
+    if (!memSearchResults.contains(event.target) && event.target !== memSearchInput) {
+      memSearchResults.classList.remove('show');
+    }
+  });
+}
+
+async function runMemorySearch() {
+  if (!memSearchInput || !memSearchResults) return;
+
+  const query = memSearchInput.value.trim();
+  if (!query) {
+    setMemorySearchResults([]);
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/memory/search?q=${encodeURIComponent(query)}`);
+    const data = await response.json();
+    setMemorySearchResults(data.results || [], data.error || '');
+  } catch (_error) {
+    setMemorySearchResults([], 'Search failed');
+  }
+}
+
+function setMemorySearchResults(items, errorText = '') {
+  if (!memSearchResults) return;
+
+  if (!items.length && !errorText) {
+    memSearchResults.innerHTML = '';
+    memSearchResults.classList.remove('show');
+    return;
+  }
+
+  if (errorText) {
+    memSearchResults.innerHTML = `<div class="empty">${escHtml(errorText)}</div>`;
+    memSearchResults.classList.add('show');
+    return;
+  }
+
+  memSearchResults.innerHTML = items.map(item => {
+    const score = Number(item.score || 0);
+    const preview = String(item.content || '').slice(0, 220);
+    return `<div class="search-result">
+      <span class="search-score">${(score * 100).toFixed(0)}%</span>
+      <span class="search-text">${escHtml(preview)}</span>
+    </div>`;
+  }).join('');
+  memSearchResults.classList.add('show');
+}
+
 const MAX_LOG_LINES = 200;
 let logLines = [];
 
@@ -1169,7 +1383,9 @@ function formatLogLine(line) {
 
   const formatted = escHtml(line).replace(
     /(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},\\d{3}) \\[(\\w+)\\] ([\\w.]+):/,
-    (_, ts, level, mod) => `<span style="color:rgba(255,255,255,0.48)">${ts}</span> [${level}] <span class="log-mod">${mod}</span>:`
+    (_, ts, level, mod) =>
+      `<span style="color:rgba(255,255,255,0.48)">${ts}</span> ` +
+      `[${level}] <span class="log-mod">${mod}</span>:`
   );
   return `<div class="${cls}">${formatted}</div>`;
 }
@@ -1233,7 +1449,11 @@ async function sendChat() {
       if (reply) {
         appendMsg('brain', 'Jarvis', reply);
       } else {
-        appendMsg('brain', 'Jarvis', `[Cycle ${data.cycle}] Processed your message through all cognitive phases.`);
+        appendMsg(
+          'brain',
+          'Jarvis',
+          `[Cycle ${data.cycle}] Processed your message through all cognitive phases.`,
+        );
       }
       const conf = meta.confidence;
       if (conf !== undefined) {
@@ -1254,7 +1474,9 @@ function appendThinking(id) {
   const div = document.createElement('div');
   div.id = id;
   div.className = 'msg brain thinking-msg';
-  div.innerHTML = '<div class="msg-role">Jarvis</div><div class="thinking-dots"><span></span><span></span><span></span></div>';
+  div.innerHTML =
+    '<div class="msg-role">Jarvis</div>' +
+    '<div class="thinking-dots"><span></span><span></span><span></span></div>';
   panel.appendChild(div);
   panel.scrollTop = panel.scrollHeight;
 }
@@ -1341,6 +1563,16 @@ function clampProgress(value) {
 # SSE event stream
 # ---------------------------------------------------------------------------
 
+
+def _socket_path_for(request: web.Request | None = None) -> Path:
+    if request is None:
+        return SOCKET_PATH
+    return Path(request.app.get("socket_path", SOCKET_PATH))
+
+
+def _client_for(request: web.Request | None = None) -> DaemonClient:
+    return DaemonClient(_socket_path_for(request))
+
 async def sse_stream(request: web.Request) -> web.StreamResponse:
     """Server-Sent Events endpoint — pushes status, thoughts, goals, and log lines."""
     resp = web.StreamResponse(headers={
@@ -1350,7 +1582,7 @@ async def sse_stream(request: web.Request) -> web.StreamResponse:
     })
     await resp.prepare(request)
 
-    client = DaemonClient(SOCKET_PATH)
+    client = _client_for(request)
     log_offset = _get_log_tail_offset(200)
 
     async def send(event: str, data: object) -> None:
@@ -1411,11 +1643,11 @@ def _read_new_log_lines(offset: int) -> tuple[list[str], int]:
     size = LOG_PATH.stat().st_size
     if size <= offset:
         return [], offset
-    with open(LOG_PATH, "r", errors="replace") as f:
+    with open(LOG_PATH, errors="replace") as f:
         f.seek(offset)
         data = f.read(size - offset)
     new_offset = offset + len(data.encode("utf-8", errors="replace"))
-    lines = [l for l in data.splitlines() if l.strip()]
+    lines = [line for line in data.splitlines() if line.strip()]
     return lines, new_offset
 
 
@@ -1431,14 +1663,50 @@ async def chat_handler(request: web.Request) -> web.Response:
         if not message:
             return web.json_response({"error": "message is required"}, status=400)
 
-        client = DaemonClient(SOCKET_PATH)
+        client = _client_for(request)
         result = await asyncio.wait_for(client.chat(message), timeout=300.0)
         return web.json_response(result)
 
-    except asyncio.TimeoutError:
-        return web.json_response({"error": "Still thinking... (model is slow, try again in a moment)"}, status=504)
+    except TimeoutError:
+        return web.json_response(
+            {"error": "Still thinking... (model is slow, try again in a moment)"},
+            status=504,
+        )
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=502)
+
+
+async def goals_add_handler(request: web.Request) -> web.Response:
+    """POST /api/goals — add a new goal via daemon IPC."""
+    try:
+        body = await request.json()
+        description = body.get("description", "").strip()
+        priority = float(body.get("priority", 0.5))
+        if not description:
+            return web.json_response({"error": "description is required"}, status=400)
+
+        client = _client_for(request)
+        result = await asyncio.wait_for(
+            client.add_goal(description=description, priority=priority),
+            timeout=10.0,
+        )
+        return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+
+
+async def memory_search_handler(request: web.Request) -> web.Response:
+    """GET /api/memory/search?q=... — search episodic memory."""
+    query = request.rel_url.query.get("q", "").strip()
+    if not query:
+        return web.json_response({"results": []})
+
+    try:
+        client = _client_for(request)
+        result = await asyncio.wait_for(client.memory_search(query=query, top_k=10), timeout=15.0)
+        return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"results": [], "error": str(exc)}, status=502)
 
 
 # ---------------------------------------------------------------------------
@@ -1452,10 +1720,16 @@ def create_app(socket_path: Path | None = None) -> web.Application:
     app.router.add_get("/", lambda r: web.Response(text=HTML, content_type="text/html"))
     app.router.add_get("/events", sse_stream)
     app.router.add_post("/chat", chat_handler)
+    app.router.add_post("/api/goals", goals_add_handler)
+    app.router.add_get("/api/memory/search", memory_search_handler)
     return app
 
 
-async def run_webui(host: str = "0.0.0.0", port: int = PORT, socket_path: Path | None = None) -> None:
+async def run_webui(
+    host: str = "0.0.0.0",
+    port: int = PORT,
+    socket_path: Path | None = None,
+) -> None:
     """Start the web UI as an async task — for embedding inside the daemon."""
     import socket as _socket
     app = create_app(socket_path=socket_path)
@@ -1493,7 +1767,7 @@ def main(host: str = "0.0.0.0", port: int = PORT) -> None:
     except Exception:
         local_ip = "your-machine-ip"
 
-    print(f"Jarvis Web UI:")
+    print("Jarvis Web UI:")
     print(f"  Local:   http://localhost:{port}")
     print(f"  Network: http://{local_ip}:{port}  ← open this on your phone")
     print(f"  Socket:  {SOCKET_PATH}")

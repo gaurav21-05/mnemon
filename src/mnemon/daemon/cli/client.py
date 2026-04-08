@@ -46,13 +46,13 @@ class DaemonClient:
                 response = json.loads(data.decode("utf-8"))
             finally:
                 await stream.aclose()
-        except ConnectionRefusedError:
+        except ConnectionRefusedError as exc:
             raise RuntimeError(
                 "Connection refused. The daemon may have crashed. "
                 "Check logs with: mnemon daemon logs"
-            )
+            ) from exc
         except Exception as exc:
-            raise RuntimeError(f"IPC communication failed: {exc}")
+            raise RuntimeError(f"IPC communication failed: {exc}") from exc
 
         if "error" in response:
             err = response["error"]
@@ -78,6 +78,24 @@ class DaemonClient:
 
     async def add_goal(self, description: str, priority: float = 0.5) -> dict[str, Any]:
         return await self.call("goals.add", description=description, priority=priority)
+
+    async def improve_analyze(self) -> dict[str, Any]:
+        return await self.call("improve.analyze")
+
+    async def improve_start(self, goal: str = "improve code quality") -> dict[str, Any]:
+        return await self.call("improve.start", goal=goal)
+
+    async def improve_status(self) -> dict[str, Any]:
+        return await self.call("improve.status")
+
+    async def improve_approve(self) -> dict[str, Any]:
+        return await self.call("improve.approve")
+
+    async def improve_abort(self) -> dict[str, Any]:
+        return await self.call("improve.abort")
+
+    async def memory_search(self, query: str, top_k: int = 10) -> dict[str, Any]:
+        return await self.call("memory.search", query=query, top_k=top_k)
 
     async def approve(self, action_id: str) -> dict[str, Any]:
         return await self.call("approve", action_id=action_id)
@@ -170,7 +188,8 @@ class DaemonClient:
         return await self.call("workspace.worktree_remove", path=path, force=force)
 
     async def mark_inbox_read(self, message_id: str | None = None) -> dict[str, Any]:
-        return await self.call("inbox.mark_read", **({"message_id": message_id} if message_id else {}))
+        params = {"message_id": message_id} if message_id else {}
+        return await self.call("inbox.mark_read", **params)
 
     async def shutdown(self) -> dict[str, Any]:
         return await self.call("shutdown")

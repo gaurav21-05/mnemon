@@ -1,37 +1,54 @@
 # Mnemon
 
-A brain-like cognitive memory framework for AI agents. Mnemon provides a modular,
-bio-inspired memory architecture that mirrors real cognitive systems — episodic,
-semantic, procedural, working, sensory, and valence memory — connected via an
-event bus and driven by a 6-phase cognitive cycle.
+Mnemon is a brain-like memory framework for AI agents, plus an always-on daemon layer that turns those memory systems into a practical personal assistant. It combines episodic, semantic, procedural, working, sensory, and valence memory with goal management, consolidation, and daemon-side interfaces such as CLI, web UI, and MCP.
 
-## Features
+## What you get
 
-- **6 Memory Subsystems** — episodic (hippocampus), semantic (neocortex), procedural (basal ganglia), working (dlPFC), sensory (thalamus), valence (amygdala)
-- **Learning Pipeline** — consolidation (episodic-to-semantic), prioritized replay, reward prediction error, skill acquisition
-- **Cognitive Control** — orchestrator, attention gating, hierarchical goals, metacognition
-- **Pluggable Backends** — in-memory (zero-dep), Qdrant, FalkorDB, Neo4j, SQLite, PostgreSQL
-- **Any LLM** — 100+ providers via LiteLLM (OpenAI, Anthropic, Ollama, Groq, Mistral, etc.)
-- **Async-First** — full asyncio support via anyio
+### Core cognitive framework
 
-## Quick Start
+- **6 memory subsystems** — episodic, semantic, procedural, working, sensory, and valence
+- **6-phase cognitive cycle** — perception, attention, retrieval, deliberation, execution, learning
+- **Learning pipeline** — consolidation, prioritized replay, reward prediction error, skill acquisition
+- **Goal management** — hierarchical goals with LLM-assisted decomposition
+- **Pluggable storage** — in-memory, Qdrant, FalkorDB, Neo4j, SQLite, PostgreSQL
+- **LLM provider flexibility** — OpenAI, Anthropic, Ollama, Groq, Mistral, and other LiteLLM-supported models
+- **Async-first design** — built around `anyio` / `asyncio`
 
-### Installation
+### Daemon layer
+
+- **Long-running Jarvis-style daemon** with persistent goals and memory-aware chat
+- **Unix-socket IPC API** for CLI and external adapters
+- **Workspace tools** for bounded file inspection, patching, verification, git diff/status, and worktrees
+- **Supervised self-improvement workflow** with analyze → plan → worktree → patch → verify → approve/abort
+- **Web UI dashboard** with live thoughts, goal management, chat, log tail, and memory search
+- **MCP bridge examples** for both direct memory access and talking to a running daemon
+
+## Installation
+
+### Base install
 
 ```bash
 pip install mnemon
-
-# Or with optional backends
-pip install "mnemon[qdrant,sqlite,scheduler]"
 ```
 
-### Basic Usage
+### Install with optional extras
+
+```bash
+# Common development / demo extras
+pip install "mnemon[mcp,sqlite,scheduler]"
+
+# Everything
+pip install "mnemon[all]"
+```
+
+## Quick start: core framework
 
 ```python
 import anyio
 from mnemon.factory import MnemonFactory
 
-async def main():
+
+async def main() -> None:
     brain = await MnemonFactory().build()
 
     async with brain:
@@ -41,10 +58,13 @@ async def main():
 
     await brain.close()
 
+
 anyio.run(main)
 ```
 
-### Interactive Agent Example
+## Interactive examples
+
+### Agent demo
 
 ```bash
 # OpenAI
@@ -55,82 +75,176 @@ python examples/agent.py
 export ANTHROPIC_API_KEY=sk-ant-...
 python examples/agent.py --model claude-3-5-haiku-20241022
 
-# Ollama (local, no API key needed)
+# Ollama
 python examples/agent.py --model ollama/llama3
-
-# Custom settings
-python examples/agent.py --model gpt-4o --temperature 0.5 --debug
 ```
 
-The agent provides a REPL with commands: `/memories`, `/facts`, `/skills`,
-`/state`, `/consolidate`, `/goals`, `/help`, `/quit`.
-
-### MCP Memory Server (for other agents)
-
-Expose Mnemon as an MCP tool server so any MCP-compatible agent can store and
-retrieve long-term memory.
+### Memory-focused chatbot demo
 
 ```bash
-# Install optional MCP dependency
+python examples/chatbot_with_memory.py
+```
+
+## Daemon quick start
+
+The daemon layer exposes Mnemon as a long-running assistant with CLI, IPC, and web UI surfaces.
+
+### Start the daemon
+
+```bash
+python -m mnemon.daemon.cli.app start --foreground
+```
+
+In another shell:
+
+```bash
+python -m mnemon.daemon.cli.app status
+python -m mnemon.daemon.cli.app chat "Remember that I'm working on mnemon"
+python -m mnemon.daemon.cli.app goals add "Ship the daemon bridge example"
+python -m mnemon.daemon.cli.app thoughts --limit 5
+```
+
+### Goal management
+
+```bash
+python -m mnemon.daemon.cli.app goals add "Write release notes" --priority 0.8
+python -m mnemon.daemon.cli.app goals list
+```
+
+### Workspace tooling through the daemon
+
+```bash
+python -m mnemon.daemon.cli.app ls src/mnemon/daemon
+python -m mnemon.daemon.cli.app read src/mnemon/daemon/ipc.py
+python -m mnemon.daemon.cli.app git-status
+python -m mnemon.daemon.cli.app verify "python -m pytest tests/unit -q"
+```
+
+### Supervised self-improvement
+
+Mnemon can run a guarded self-improvement workflow against its own repo:
+
+1. Analyze current git/test state
+2. Ask the LLM for a small structured patch plan
+3. Create an isolated git worktree
+4. Apply the planned patches
+5. Re-run verification inside the worktree
+6. Wait for human approval before merge
+
+```bash
+# Analysis only
+python -m mnemon.daemon.cli.app improve --analyze
+
+# Start a run
+python -m mnemon.daemon.cli.app improve "improve code quality and fix any failing tests"
+
+# Poll progress
+python -m mnemon.daemon.cli.app improve --status
+
+# Finish or discard once awaiting approval
+python -m mnemon.daemon.cli.app improve --approve
+python -m mnemon.daemon.cli.app improve --abort
+```
+
+## Web UI
+
+Run the dashboard as a standalone process:
+
+```bash
+python -m mnemon.daemon.webui
+```
+
+Open <http://localhost:7777>.
+
+The UI includes:
+
+- daemon status and uptime
+- live idle-thought stream
+- active goals panel
+- inline goal creation form
+- chat composer for Jarvis
+- live log tail
+- memory search box in the top bar
+
+## MCP integrations
+
+### 1) Direct memory server
+
+`examples/mcp_memory_server.py` exposes Mnemon memory tools directly.
+
+```bash
 pip install "mnemon[mcp]"
 
-# Optional: set model for consolidation (if omitted, consolidation is disabled)
 export MNEMON_MCP_MODEL=ollama/llama3.2
 export MNEMON_MCP_EMBED_MODEL=ollama/nomic-embed-text
 export MNEMON_MCP_EMBED_DIM=768
 export MNEMON_MCP_NAMESPACE=mnemon
 
-# Run server
 python examples/mcp_memory_server.py
 ```
 
-Exposed MCP tools:
-- `mnemon.memory_write(content, agent_id, session_id, tags, importance)`
-- `mnemon.memory_retrieve(query, top_k, min_score)`
+Exposed tools:
+
+- `mnemon.memory_write(...)`
+- `mnemon.memory_retrieve(...)`
 - `mnemon.memory_consolidate()`
 - `mnemon.memory_state()`
 - `mnemon.memory_resources_list()`
 - `mnemon.memory_resources_read(uri)`
 
-MCP resources (when client/server supports resource APIs):
-- `memory://mnemon/state`
-- `memory://mnemon/episodes/recent`
+### 2) Running-daemon MCP bridge
+
+`examples/mcp_daemon_server.py` exposes a *running daemon* as MCP tools over stdio.
+
+Start the daemon first:
+
+```bash
+python -m mnemon.daemon.cli.app start --foreground
+```
+
+Then start the MCP bridge:
+
+```bash
+python examples/mcp_daemon_server.py
+```
+
+Exposed daemon tools:
+
+- `daemon_chat(message)`
+- `daemon_goals_list()`
+- `daemon_goals_add(description, priority)`
+- `daemon_memory_search(query, top_k)`
 
 ## Architecture
 
-Mnemon implements a **6-phase cognitive cycle**:
+Mnemon implements a 6-phase cognitive cycle:
 
+```text
+Input
+  -> 1. PERCEPTION   (sensory buffer -> percept)
+  -> 2. ATTENTION    (salience scoring, gate: broadcast/queue/discard)
+  -> 3. RETRIEVAL    (episodic + semantic + procedural fan-out)
+  -> 4. DELIBERATION (assemble memory + goals + state)
+  -> 5. EXECUTION    (agent/framework produces response or action)
+  -> 6. LEARNING     (encode episode, update reward/valence/meta state)
 ```
-Input ─> 1. PERCEPTION  (sensory buffer → PerceptUnit)
-      ─> 2. ATTENTION   (salience scoring, gate: broadcast/queue/discard)
-      ─> 3. RETRIEVAL   (cue-driven fan-out → episodic + semantic + procedural)
-      ─> 4. DELIBERATION (assemble context + goals for action selection)
-      ─> 5. EXECUTION   (agent framework consumes context, generates response)
-      ─> 6. LEARNING    (encode episode, compute RPE, update valence, meta-eval)
-```
 
-### Module Map
+### Module map
 
-| Module | Brain Analog | Role |
-|--------|-------------|------|
-| SensoryBuffer | Thalamus | Pre-attentive input processing with TTL |
-| WorkingMemory | dlPFC | Token-budget-constrained active context |
-| EpisodicMemory | Hippocampus | One-shot episode encoding, pattern completion |
-| SemanticMemory | Neocortex | Knowledge graph with spreading activation |
-| ProceduralMemory | Basal ganglia | Skill library with utility learning |
-| ValenceMemory | Amygdala | Emotional associations, rapid appraisal |
-| ConsolidationEngine | Sleep replay | Episodic → semantic fact extraction |
-| AttentionController | Basal forebrain | Selective gating, adaptive thresholds |
-| GoalManager | Anterior PFC | Hierarchical goals, LLM decomposition |
-| MetaCognition | ACC | Error monitoring, strategy selection |
-| CognitiveBus | Thalamic relay | Inter-module event routing |
-| Orchestrator | Lateral PFC | Central executive, cycle coordination |
+| Module | Role |
+| --- | --- |
+| `src/mnemon/core/` | models, config, interfaces, exceptions, bus, registry |
+| `src/mnemon/memory/` | episodic, semantic, procedural, working, sensory, valence |
+| `src/mnemon/learning/` | consolidation, replay, reward, skill acquisition |
+| `src/mnemon/control/` | orchestrator, attention, goals, metacognition |
+| `src/mnemon/backends/` | in-memory and external storage backends |
+| `src/mnemon/daemon/` | daemon runtime, IPC, lifecycle, tools, web UI |
+| `src/mnemon/services/` | external-facing service adapters |
+| `examples/` | runnable demos and MCP examples |
 
 ## Configuration
 
-### Environment Variables
-
-All settings use the `MNEMON__` prefix with double-underscore nesting:
+Mnemon uses `MNEMON__` environment variables with double-underscore nesting:
 
 ```bash
 MNEMON__LLM__DEFAULT_PROVIDER=openai
@@ -139,81 +253,58 @@ MNEMON__EPISODIC__CAPACITY__MAX_EPISODES=50000
 MNEMON__ATTENTION__BROADCAST_THRESHOLD=0.6
 ```
 
-### TOML File
+You can also load a TOML file:
 
 ```python
 from mnemon.core.config import load_config
 
 config = load_config("/path/to/mnemon.toml")
-brain = await MnemonFactory(config).build()
-```
-
-### Programmatic
-
-```python
-from mnemon.core.config import MnemonConfig
-
-config = MnemonConfig()
-config.working_memory.token_budget = 16384
-config.llm.default_provider = "anthropic"
-config.llm.providers["anthropic"] = {
-    "model": "claude-3-5-haiku-20241022",
-    "embedding_model": "text-embedding-3-small",
-}
-```
-
-## LLM Providers
-
-Mnemon uses [LiteLLM](https://docs.litellm.ai/) for provider abstraction:
-
-```bash
-# OpenAI
-export OPENAI_API_KEY=sk-...
-
-# Anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# Groq
-export GROQ_API_KEY=gsk_...
-
-# Ollama (local)
-# No key needed, just run: ollama serve
 ```
 
 ## Development
 
 ```bash
-# Install dev dependencies
+# Install editable package + dev deps
 pip install -e ".[all]"
 pip install pytest pytest-asyncio pytest-benchmark hypothesis ruff mypy
 
-# Run tests
-pytest tests/unit/ -v           # 199 unit tests
-pytest tests/integration/ -v    # 17 integration tests
-pytest tests/ -v                # All tests
+# Unit tests
+pytest tests/unit -v
 
-# Lint and format
-ruff check src/ tests/
-ruff format src/ tests/
+# Integration tests
+pytest tests/integration -v
 
-# Type check
-mypy src/mnemon/
+# Whole suite
+pytest tests -v
+
+# Lint + format
+ruff check src tests examples
+ruff format src tests examples
+
+# Type-check
+mypy src/mnemon
 ```
 
-## Project Structure
+## Roadmap
 
-```
-src/mnemon/
-    core/           # Models, config, interfaces, exceptions, event bus, registry
-    memory/         # Episodic, semantic, procedural, working, sensory, valence
-    backends/       # In-memory, Qdrant, SQLite, FalkorDB storage implementations
-    learning/       # Consolidation, replay, reward, skill acquisition
-    control/        # Orchestrator, attention, goals, metacognition
-    evaluation/     # Benchmark suite (retrieval, forgetting, calibration, latency)
-    providers/      # LiteLLM wrapper for LLM and embedding providers
-    scheduling/     # APScheduler-based consolidation scheduling
-    factory.py      # One-shot builder that wires the entire framework
-```
+**Bugs / correctness**
+- [x] Consolidation engine: mark episodes as `FAILED` after N LLM extraction retries
+- [x] Semantic store: atomic write between vector index and SQLite `_docs` table
+
+**Self-improvement**
+- [x] `daemon/improve.py` — 6-phase supervised workflow (analyze → plan → worktree → patch → verify → approve/abort)
+- [x] IPC + CLI integration (`improve.analyze`, `improve.start`, `improve.status`, `improve.approve`, `improve.abort`)
+- [ ] Structured planning memory: persist improvement plans across sessions in episodic store
+
+**Interfaces**
+- [x] Web UI: goal creation form
+- [x] Web UI: memory search widget
+- [x] MCP daemon bridge (`examples/mcp_daemon_server.py`)
+
+**Distribution**
+- [ ] PyPI release
+- [ ] Docker image
+- [ ] Homebrew formula (macOS)
 
 ## License
 

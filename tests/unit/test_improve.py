@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from mnemon.daemon.improve import ImprovementSession, Phase, SelfImprovementOrchestrator
 from mnemon.daemon.tools.workspace import JarvisWorkspace
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 pytestmark = pytest.mark.asyncio
 
