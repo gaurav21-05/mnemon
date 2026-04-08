@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -383,11 +384,14 @@ class MnemonFactory:
         config = self._config
 
         # ----------------------------------------------------------
-        # Stage 1: Build registry (backends + LLM providers)
+        # Stage 1: Registry for LLM/embedding providers only
         # ----------------------------------------------------------
         try:
-            logger.info("MnemonFactory.build() — wiring ModuleRegistry.")
-            registry: ModuleRegistry = ModuleRegistry.from_config(config)
+            logger.info("MnemonFactory.build() — wiring ModuleRegistry (LLM/embedding only).")
+            registry: ModuleRegistry = ModuleRegistry()
+            registry._wire_llm_providers(config)
+            llm: LLMProvider = registry.resolve(LLMProvider)
+            embedder: EmbeddingProvider = registry.resolve(EmbeddingProvider)
         except ConfigError:
             raise
         except Exception as exc:
@@ -395,41 +399,51 @@ class MnemonFactory:
                 f"ModuleRegistry assembly failed: {exc}"
             ) from exc
 
-        # ----------------------------------------------------------
-        # Stage 2: Resolve infrastructure providers
-        # ----------------------------------------------------------
-        try:
-            vector_store: VectorStore = registry.resolve(VectorStore)
-            document_store: DocumentStore = registry.resolve(DocumentStore)
-            graph_store: GraphStore = registry.resolve(GraphStore)
-            llm: LLMProvider = registry.resolve(LLMProvider)
-            embedder: EmbeddingProvider = registry.resolve(EmbeddingProvider)
-        except ConfigError:
-            raise
-        except Exception as exc:
-            raise ConfigError(
-                f"Provider resolution from registry failed: {exc}"
-            ) from exc
-
         logger.info(
-            "Resolved providers — VectorStore=%s DocumentStore=%s "
-            "GraphStore=%s LLM=%s Embedder=%s",
-            type(vector_store).__name__,
-            type(document_store).__name__,
-            type(graph_store).__name__,
+            "Resolved LLM/embedding providers — LLM=%s Embedder=%s",
             type(llm).__name__,
             type(embedder).__name__,
         )
 
         # ----------------------------------------------------------
-        # Stage 3: Memory stores
+        # Stage 2: Per-memory-type isolated stores (no sharing)
+        # ----------------------------------------------------------
+        try:
+            state_dir = Path("~/.mnemon/").expanduser()
+            episodic_vs, episodic_ds = self._make_stores(config, "episodic", state_dir)
+            semantic_vs, semantic_ds = self._make_stores(config, "semantic", state_dir)
+            procedural_vs, procedural_ds = self._make_stores(config, "procedural", state_dir)
+            semantic_gs = self._make_graph_store(config, "semantic", state_dir)
+        except ConfigError:
+            raise
+        except Exception as exc:
+            raise ConfigError(
+                f"Isolated store creation failed: {exc}"
+            ) from exc
+
+        logger.info(
+            "Created isolated stores — "
+            "episodic: VectorStore=%s DocumentStore=%s | "
+            "semantic: VectorStore=%s DocumentStore=%s GraphStore=%s | "
+            "procedural: VectorStore=%s DocumentStore=%s",
+            type(episodic_vs).__name__,
+            type(episodic_ds).__name__,
+            type(semantic_vs).__name__,
+            type(semantic_ds).__name__,
+            type(semantic_gs).__name__,
+            type(procedural_vs).__name__,
+            type(procedural_ds).__name__,
+        )
+
+        # ----------------------------------------------------------
+        # Stage 3: Memory stores (using isolated backends)
         # ----------------------------------------------------------
         try:
             sensory = self._build_sensory(config, embedder)
             working = self._build_working(config, llm)
-            episodic = self._build_episodic(config, vector_store, document_store, embedder)
-            semantic = self._build_semantic(config, graph_store, vector_store, document_store, embedder, llm)
-            procedural = self._build_procedural(config, vector_store, document_store, embedder)
+            episodic = self._build_episodic(config, episodic_vs, episodic_ds, embedder)
+            semantic = self._build_semantic(config, semantic_gs, semantic_vs, semantic_ds, embedder, llm)
+            procedural = self._build_procedural(config, procedural_vs, procedural_ds, embedder)
             valence = self._build_valence(config, embedder)
         except ConfigError:
             raise
@@ -519,7 +533,11 @@ class MnemonFactory:
         # ----------------------------------------------------------
         # Stage 8: Backend initialisation
         # ----------------------------------------------------------
-        backends = [vector_store, document_store, graph_store]
+        backends = [
+            episodic_vs, episodic_ds,
+            semantic_vs, semantic_ds, semantic_gs,
+            procedural_vs, procedural_ds,
+        ]
         await self._initialize_backends(backends)
 
         # ----------------------------------------------------------
@@ -560,6 +578,96 @@ class MnemonFactory:
             "MnemonFactory.build() complete — cognitive framework is online."
         )
         return mnemon
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Per-memory-type isolated store factories
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_stores(
+        config: MnemonConfig, namespace: str, state_dir: Path
+    ) -> tuple[Any, Any]:
+        """Create isolated VectorStore + DocumentStore for a memory namespace."""
+        vector_store = MnemonFactory._make_vector_store(config, namespace, state_dir)
+        document_store = MnemonFactory._make_document_store(config, namespace, state_dir)
+        return vector_store, document_store
+
+    @staticmethod
+    def _make_vector_store(
+        config: MnemonConfig, namespace: str, state_dir: Path
+    ) -> Any:
+        """Select and instantiate the appropriate VectorStore for a namespace."""
+        import importlib
+
+        backend = getattr(config.episodic, "backend", "auto")
+
+        def _importable(m: str) -> bool:
+            try:
+                importlib.import_module(m)
+                return True
+            except ImportError:
+                return False
+
+        if _importable("hnswlib") and backend not in ("memory", "postgres", "sqlite"):
+            from mnemon.backends.hnswlib_store import HNSWLibVectorStore
+            path = state_dir / "vectors" / f"{namespace}.hnsw"
+            return HNSWLibVectorStore(index_path=str(path))
+        elif _importable("qdrant_client") and backend == "qdrant":
+            from mnemon.backends.qdrant_store import QdrantVectorStore
+            return QdrantVectorStore(config)
+        else:
+            from mnemon.backends.memory_store import InMemoryVectorStore
+            return InMemoryVectorStore(config)
+
+    @staticmethod
+    def _make_document_store(
+        config: MnemonConfig, namespace: str, state_dir: Path
+    ) -> Any:
+        """Select and instantiate the appropriate DocumentStore for a namespace."""
+        import importlib
+
+        def _importable(m: str) -> bool:
+            try:
+                importlib.import_module(m)
+                return True
+            except ImportError:
+                return False
+
+        if _importable("aiosqlite"):
+            from mnemon.backends.sqlite_store import SQLiteDocumentStore
+            db_path = str(state_dir / "documents" / f"{namespace}.db")
+            return SQLiteDocumentStore(config, db_path=db_path)
+        else:
+            from mnemon.backends.memory_store import InMemoryDocumentStore
+            return InMemoryDocumentStore(config)
+
+    @staticmethod
+    def _make_graph_store(
+        config: MnemonConfig, namespace: str, state_dir: Path
+    ) -> Any:
+        """Select and instantiate the appropriate GraphStore for a namespace."""
+        import importlib
+
+        backend = getattr(config.semantic, "graph_backend", "auto")
+
+        def _importable(m: str) -> bool:
+            try:
+                importlib.import_module(m)
+                return True
+            except ImportError:
+                return False
+
+        if _importable("igraph") and backend not in ("memory", "falkordb", "neo4j"):
+            from mnemon.backends.igraph_store import IGraphGraphStore
+            path = state_dir / "graphs" / f"{namespace}.json"
+            return IGraphGraphStore(graph_path=str(path))
+        elif _importable("falkordb") and backend == "falkordb":
+            from mnemon.backends.falkordb_store import FalkorDBGraphStore
+            return FalkorDBGraphStore(config)
+        else:
+            from mnemon.backends.memory_store import InMemoryGraphStore
+            return InMemoryGraphStore(config)
 
     # ------------------------------------------------------------------
     # Private stage helpers — each is a thin wrapper that provides a

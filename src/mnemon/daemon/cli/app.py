@@ -178,12 +178,136 @@ def cmd_pending(args: argparse.Namespace) -> None:
         print(f"        id={a['id']} source={a['source']}")
 
 
+def cmd_browse(args: argparse.Namespace) -> None:
+    """Run a browsing task through the daemon."""
+    client = _get_client()
+    result = anyio.run(client.browse, args.task)
+    print(result.get("result", ""))
+
+
+def cmd_ls(args: argparse.Namespace) -> None:
+    """List a workspace directory via the daemon."""
+    client = _get_client()
+    result = anyio.run(client.list_dir, args.path)
+    for entry in result.get("entries", []):
+        print(f"{entry['type']:>4}  {entry['path']}")
+
+
+def cmd_read(args: argparse.Namespace) -> None:
+    """Read a workspace file via the daemon."""
+    client = _get_client()
+    result = anyio.run(client.read_file, args.path)
+    print(result.get("content", ""))
+    if result.get("truncated"):
+        print("\n...<truncated>...")
+
+
+def cmd_write(args: argparse.Namespace) -> None:
+    """Write a workspace file via the daemon."""
+    client = _get_client()
+    content = args.content
+    if content is None:
+        content = sys.stdin.read()
+    result = anyio.run(client.write_file, args.path, content, args.append)
+    print(
+        f"Wrote {result.get('bytes_written', 0)} bytes to {result.get('path', args.path)}"
+    )
+
+
+def cmd_exec(args: argparse.Namespace) -> None:
+    """Run a bounded command via the daemon."""
+    client = _get_client()
+    result = anyio.run(client.exec_command, args.command, args.cwd, args.timeout)
+    print(f"exit_code={result.get('exit_code')}")
+    print(f"cwd={result.get('cwd')}")
+    stdout = result.get("stdout", "")
+    stderr = result.get("stderr", "")
+    if stdout:
+        print("\nstdout:")
+        print(stdout)
+    if stderr:
+        print("\nstderr:")
+        print(stderr)
+    if result.get("timed_out"):
+        print("\ntimed_out=true")
+
+
+def cmd_patch(args: argparse.Namespace) -> None:
+    """Apply a targeted patch in the daemon workspace."""
+    client = _get_client()
+    result = anyio.run(
+        client.patch_file,
+        args.path,
+        args.search,
+        args.replace,
+        args.cwd,
+        args.replace_all,
+    )
+    print(result.get("diff", ""))
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Run verification commands through the daemon."""
+    client = _get_client()
+    result = anyio.run(client.verify, args.command, args.cwd, args.timeout)
+    print(f"passed={result.get('passed')}")
+    for item in result.get("results", []):
+        print(f"\n$ {item.get('command')}")
+        print(f"exit_code={item.get('exit_code')} timed_out={item.get('timed_out')}")
+        if item.get("stdout"):
+            print(item["stdout"])
+        if item.get("stderr"):
+            print(item["stderr"])
+
+
+def cmd_diff(args: argparse.Namespace) -> None:
+    """Show git diff through the daemon."""
+    client = _get_client()
+    result = anyio.run(client.git_diff, args.cwd)
+    print(result.get("stdout", ""))
+    if result.get("stderr"):
+        print(result["stderr"])
+
+
+def cmd_git_status(args: argparse.Namespace) -> None:
+    """Show git status through the daemon."""
+    client = _get_client()
+    result = anyio.run(client.git_status, args.cwd)
+    print(result.get("stdout", ""))
+    if result.get("stderr"):
+        print(result["stderr"])
+
+
+def cmd_worktree_create(args: argparse.Namespace) -> None:
+    """Create a managed git worktree through the daemon."""
+    client = _get_client()
+    result = anyio.run(client.create_worktree, args.branch, args.base_ref, args.path)
+    print(f"path={result.get('path')}")
+    if result.get("stdout"):
+        print(result["stdout"])
+    if result.get("stderr"):
+        print(result["stderr"])
+
+
+def cmd_worktree_remove(args: argparse.Namespace) -> None:
+    """Remove a managed git worktree through the daemon."""
+    client = _get_client()
+    result = anyio.run(client.remove_worktree, args.path, args.force)
+    print(f"path={result.get('path')}")
+    if result.get("stdout"):
+        print(result["stdout"])
+    if result.get("stderr"):
+        print(result["stderr"])
+
+
 def cmd_approve(args: argparse.Namespace) -> None:
     """Approve a pending action."""
     client = _get_client()
     result = anyio.run(client.approve, args.action_id)
     if result.get("approved"):
         print("Action approved.")
+        if result.get("reply"):
+            print(result["reply"])
     else:
         print("Action not found.")
 
@@ -264,6 +388,8 @@ def _print_chat_result(result: dict) -> None:
         print(f"  Confidence: {meta['confidence']:.2f}")
     if meta.get("lessons"):
         print(f"  Lessons: {', '.join(meta['lessons'])}")
+    if result.get("reply"):
+        print(f"\n{result['reply']}")
 
 
 def _handle_repl_command(client, cmd: str) -> None:
@@ -289,11 +415,64 @@ def _handle_repl_command(client, cmd: str) -> None:
             pending = anyio.run(client.pending)
             for a in pending:
                 print(f"  [{a['risk']}] {a['description']} (id={a['id']})")
+        elif command == "/browse":
+            task = cmd[len("/browse"):].strip()
+            result = anyio.run(client.browse, task)
+            print(result.get("result", ""))
+        elif command == "/ls":
+            path = parts[1] if len(parts) > 1 else "."
+            result = anyio.run(client.list_dir, path)
+            for entry in result.get("entries", []):
+                print(f"  {entry['type']:>4}  {entry['path']}")
+        elif command == "/read":
+            if len(parts) < 2:
+                print("  Usage: /read <path>")
+            else:
+                result = anyio.run(client.read_file, parts[1])
+                print(result.get("content", ""))
+                if result.get("truncated"):
+                    print("\n...<truncated>...")
+        elif command == "/write":
+            raw = cmd[len("/write"):].strip()
+            write_parts = raw.split(maxsplit=1)
+            if len(write_parts) < 2:
+                print("  Usage: /write <path> <content>")
+            else:
+                result = anyio.run(client.write_file, write_parts[0], write_parts[1], False)
+                print(
+                    f"  Wrote {result.get('bytes_written', 0)} bytes to {result.get('path', write_parts[0])}"
+                )
+        elif command == "/exec":
+            raw_command = cmd[len("/exec"):].strip()
+            result = anyio.run(client.exec_command, raw_command, None, 30.0)
+            print(f"  exit_code={result.get('exit_code')}")
+            if result.get("stdout"):
+                print(result["stdout"])
+            if result.get("stderr"):
+                print(result["stderr"])
+        elif command == "/verify":
+            raw_command = cmd[len("/verify"):].strip()
+            result = anyio.run(client.verify, [raw_command], None, 120.0)
+            print(f"  passed={result.get('passed')}")
+        elif command == "/diff":
+            result = anyio.run(client.git_diff, None)
+            print(result.get("stdout", ""))
+        elif command == "/status-git":
+            result = anyio.run(client.git_status, None)
+            print(result.get("stdout", ""))
         elif command == "/help":
             print("  /status    - Daemon status")
             print("  /thoughts  - Recent idle thinking")
             print("  /goals     - Active goals")
             print("  /pending   - Pending approvals")
+            print("  /browse    - Browse the web")
+            print("  /ls        - List workspace files")
+            print("  /read      - Read a file")
+            print("  /write     - Write a file")
+            print("  /exec      - Run a command")
+            print("  /verify    - Run a verification command")
+            print("  /diff      - Show git diff")
+            print("  /status-git - Show git status")
             print("  /help      - This help")
         else:
             print(f"  Unknown command: {command}. Type /help for commands.")
@@ -332,6 +511,76 @@ def main() -> None:
     p_chat = subparsers.add_parser("chat", help="Chat with the daemon")
     p_chat.add_argument("message", nargs="?", default=None, help="Message (omit for REPL)")
     p_chat.set_defaults(func=cmd_chat)
+
+    # browse
+    p_browse = subparsers.add_parser("browse", help="Browse the web through the daemon")
+    p_browse.add_argument("task", help="Browsing task")
+    p_browse.set_defaults(func=cmd_browse)
+
+    # ls
+    p_ls = subparsers.add_parser("ls", help="List files in the daemon workspace")
+    p_ls.add_argument("path", nargs="?", default=".", help="Directory path")
+    p_ls.set_defaults(func=cmd_ls)
+
+    # read
+    p_read = subparsers.add_parser("read", help="Read a file from the daemon workspace")
+    p_read.add_argument("path", help="File path")
+    p_read.set_defaults(func=cmd_read)
+
+    # write
+    p_write = subparsers.add_parser("write", help="Write a file in the daemon workspace")
+    p_write.add_argument("path", help="File path")
+    p_write.add_argument("content", nargs="?", default=None, help="Content to write (omit to read from stdin)")
+    p_write.add_argument("--append", action="store_true", help="Append instead of overwrite")
+    p_write.set_defaults(func=cmd_write)
+
+    # exec
+    p_exec = subparsers.add_parser("exec", help="Run a command in the daemon workspace")
+    p_exec.add_argument("command", help="Command string")
+    p_exec.add_argument("--cwd", default=None, help="Working directory relative to workspace root")
+    p_exec.add_argument("--timeout", type=float, default=30.0, help="Timeout in seconds")
+    p_exec.set_defaults(func=cmd_exec)
+
+    # patch
+    p_patch = subparsers.add_parser("patch", help="Apply a targeted patch in the daemon workspace")
+    p_patch.add_argument("path", help="File path")
+    p_patch.add_argument("search", help="Search text")
+    p_patch.add_argument("replace", help="Replacement text")
+    p_patch.add_argument("--cwd", default=None, help="Working directory relative to workspace root")
+    p_patch.add_argument("--replace-all", action="store_true", help="Replace all matches")
+    p_patch.set_defaults(func=cmd_patch)
+
+    # verify
+    p_verify = subparsers.add_parser("verify", help="Run verification commands in the daemon workspace")
+    p_verify.add_argument("command", nargs="+", help="One or more commands to run sequentially")
+    p_verify.add_argument("--cwd", default=None, help="Working directory relative to workspace root")
+    p_verify.add_argument("--timeout", type=float, default=120.0, help="Timeout per command in seconds")
+    p_verify.set_defaults(func=cmd_verify)
+
+    # diff
+    p_diff = subparsers.add_parser("diff", help="Show git diff in the daemon workspace")
+    p_diff.add_argument("--cwd", default=None, help="Working directory relative to workspace root")
+    p_diff.set_defaults(func=cmd_diff)
+
+    # git-status
+    p_git_status = subparsers.add_parser("git-status", help="Show git status in the daemon workspace")
+    p_git_status.add_argument("--cwd", default=None, help="Working directory relative to workspace root")
+    p_git_status.set_defaults(func=cmd_git_status)
+
+    # worktree
+    p_worktree = subparsers.add_parser("worktree", help="Managed git worktree operations")
+    worktree_sub = p_worktree.add_subparsers(dest="worktree_command")
+
+    p_worktree_create = worktree_sub.add_parser("create", help="Create a managed worktree")
+    p_worktree_create.add_argument("branch", help="Branch name")
+    p_worktree_create.add_argument("--base-ref", default="HEAD", help="Base ref (default: HEAD)")
+    p_worktree_create.add_argument("--path", default=None, help="Optional managed worktree path")
+    p_worktree_create.set_defaults(func=cmd_worktree_create)
+
+    p_worktree_remove = worktree_sub.add_parser("remove", help="Remove a managed worktree")
+    p_worktree_remove.add_argument("path", help="Managed worktree path")
+    p_worktree_remove.add_argument("--force", action="store_true", help="Force removal")
+    p_worktree_remove.set_defaults(func=cmd_worktree_remove)
 
     # thoughts
     p_thoughts = subparsers.add_parser("thoughts", help="View recent idle thinking")

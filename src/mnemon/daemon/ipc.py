@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -22,10 +23,365 @@ import anyio
 import anyio.abc
 from anyio import create_unix_listener
 
-from mnemon.daemon.autonomy import AutonomyController
+from mnemon.daemon.autonomy import AutonomyController, ProposedAction
+from mnemon.daemon.config import RiskLevel
 from mnemon.daemon.state import DaemonState
 
 logger = logging.getLogger(__name__)
+
+_READ_PREFIXES = (
+    "read ",
+    "read file ",
+    "show file ",
+    "show me file ",
+    "open file ",
+    "open ",
+    "cat ",
+)
+_LIST_PREFIXES = (
+    "ls",
+    "ls ",
+    "list files",
+    "list folders",
+    "list directory",
+    "list dir",
+    "show files",
+    "show folders",
+    "show directory",
+    "what's in ",
+    "what is in ",
+)
+_EXEC_PREFIXES = (
+    "run command ",
+    "execute command ",
+    "run shell command ",
+    "execute shell command ",
+)
+
+_TOOL_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "enum": ["browse", "list", "read", "write", "exec"],
+                    },
+                    "task": {"type": "string"},
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "command": {"type": "string"},
+                    "append": {"type": "boolean"},
+                },
+                "required": ["tool"],
+            },
+        }
+    },
+    "required": ["steps"],
+}
+
+_TOOL_ACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": [
+                "respond",
+                "browse",
+                "list",
+                "read",
+                "write",
+                "patch",
+                "verify",
+                "diff",
+                "git_status",
+                "worktree_create",
+                "worktree_remove",
+                "exec",
+            ],
+        },
+        "reply": {"type": "string"},
+        "task": {"type": "string"},
+        "path": {"type": "string"},
+        "content": {"type": "string"},
+        "search": {"type": "string"},
+        "replace": {"type": "string"},
+        "replace_all": {"type": "boolean"},
+        "command": {"type": "string"},
+        "commands": {"type": "array", "items": {"type": "string"}},
+        "append": {"type": "boolean"},
+        "cwd": {"type": "string"},
+        "branch": {"type": "string"},
+        "base_ref": {"type": "string"},
+        "force": {"type": "boolean"},
+    },
+    "required": ["action"],
+}
+
+_AGENTIC_HINTS = (
+    "file",
+    "folder",
+    "directory",
+    "repo",
+    "repository",
+    "workspace",
+    "command",
+    "shell",
+    "script",
+    "code",
+    "python",
+    "test",
+    "fix",
+    "implement",
+    "edit",
+    "patch",
+    "diff",
+    "verify",
+    "lint",
+    "typecheck",
+    "worktree",
+    "branch",
+    "browse",
+    "search",
+    "look up",
+    "latest",
+)
+_MAX_AGENT_TOOL_STEPS = 6
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"', "`"}:
+        return cleaned[1:-1].strip()
+    return cleaned
+
+
+def _extract_backticked_chunks(text: str) -> list[str]:
+    return [_strip_wrapping_quotes(match) for match in re.findall(r"`([^`]+)`", text)]
+
+
+def _infer_workspace_intent(message: str) -> dict[str, Any] | None:
+    stripped = message.strip()
+    lower = stripped.lower()
+    backticked = _extract_backticked_chunks(stripped)
+
+    if lower.startswith(_READ_PREFIXES):
+        path = backticked[0] if backticked else stripped.split(maxsplit=2)[-1]
+        return {"tool": "read", "path": _strip_wrapping_quotes(path)}
+
+    if lower.startswith(_LIST_PREFIXES):
+        if backticked:
+            path = backticked[0]
+        elif " in " in stripped:
+            path = stripped.split(" in ", 1)[1]
+        elif lower.startswith("ls "):
+            path = stripped[3:]
+        else:
+            path = "."
+        return {"tool": "list", "path": _strip_wrapping_quotes(path or ".")}
+
+    if lower.startswith("append to "):
+        match = re.match(r"append to\s+(`[^`]+`|\S+)\s+(.*)", stripped, flags=re.IGNORECASE)
+        if match:
+            return {
+                "tool": "write",
+                "path": _strip_wrapping_quotes(match.group(1)),
+                "content": match.group(2),
+                "append": True,
+            }
+
+    if lower.startswith(("write ", "create file ", "create ", "save to ")):
+        if lower.startswith("save to "):
+            match = re.match(r"save to\s+(`[^`]+`|\S+)\s+(.*)", stripped, flags=re.IGNORECASE)
+        else:
+            match = re.match(
+                r"(?:write|create file|create)\s+(`[^`]+`|\S+)\s+(.*)",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+        if match:
+            return {
+                "tool": "write",
+                "path": _strip_wrapping_quotes(match.group(1)),
+                "content": match.group(2),
+                "append": False,
+            }
+
+    if lower.startswith(_EXEC_PREFIXES):
+        for prefix in _EXEC_PREFIXES:
+            if lower.startswith(prefix):
+                command = stripped[len(prefix):]
+                return {"tool": "exec", "command": _strip_wrapping_quotes(command)}
+
+    if lower.startswith(("run `", "execute `")) and backticked:
+        return {"tool": "exec", "command": backticked[0]}
+
+    return None
+
+
+def _sanitize_tool_steps(raw_steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    for raw in raw_steps[:2]:
+        tool = str(raw.get("tool", "")).strip().lower()
+        if tool not in {"browse", "list", "read", "write", "exec"}:
+            continue
+
+        step: dict[str, Any] = {"tool": tool}
+        if tool == "browse":
+            task = _strip_wrapping_quotes(str(raw.get("task", "")).strip())
+            if not task:
+                continue
+            step["task"] = task
+        elif tool in {"list", "read"}:
+            path = _strip_wrapping_quotes(str(raw.get("path", "")).strip())
+            if not path:
+                continue
+            step["path"] = path
+        elif tool == "write":
+            path = _strip_wrapping_quotes(str(raw.get("path", "")).strip())
+            content = str(raw.get("content", ""))
+            if not path or not content:
+                continue
+            step["path"] = path
+            step["content"] = content
+            step["append"] = bool(raw.get("append", False))
+        elif tool == "exec":
+            command = _strip_wrapping_quotes(str(raw.get("command", "")).strip())
+            if not command:
+                continue
+            step["command"] = command
+
+        steps.append(step)
+    return steps
+
+
+def _sanitize_tool_action(raw: dict[str, Any]) -> dict[str, Any] | None:
+    action = str(raw.get("action", "")).strip().lower()
+    if action not in {
+        "respond",
+        "browse",
+        "list",
+        "read",
+        "write",
+        "patch",
+        "verify",
+        "diff",
+        "git_status",
+        "worktree_create",
+        "worktree_remove",
+        "exec",
+    }:
+        return None
+
+    if action == "respond":
+        reply = str(raw.get("reply", "")).strip()
+        if not reply:
+            return None
+        return {"action": "respond", "reply": reply}
+
+    if action == "browse":
+        task = _strip_wrapping_quotes(str(raw.get("task", "")).strip())
+        return {"action": "browse", "task": task} if task else None
+
+    if action in {"list", "read"}:
+        path = _strip_wrapping_quotes(str(raw.get("path", "")).strip())
+        return {"action": action, "path": path} if path else None
+
+    if action == "write":
+        path = _strip_wrapping_quotes(str(raw.get("path", "")).strip())
+        content = str(raw.get("content", ""))
+        if not path or not content:
+            return None
+        return {
+            "action": "write",
+            "path": path,
+            "content": content,
+            "append": bool(raw.get("append", False)),
+        }
+
+    if action == "patch":
+        path = _strip_wrapping_quotes(str(raw.get("path", "")).strip())
+        search = str(raw.get("search", ""))
+        replace = str(raw.get("replace", ""))
+        if not path or not search:
+            return None
+        payload = {
+            "action": "patch",
+            "path": path,
+            "search": search,
+            "replace": replace,
+            "replace_all": bool(raw.get("replace_all", False)),
+        }
+        cwd = _strip_wrapping_quotes(str(raw.get("cwd", "")).strip())
+        if cwd:
+            payload["cwd"] = cwd
+        return payload
+
+    if action == "verify":
+        commands = raw.get("commands", [])
+        if not isinstance(commands, list):
+            return None
+        cleaned = [str(item).strip() for item in commands if str(item).strip()]
+        if not cleaned:
+            return None
+        payload = {"action": "verify", "commands": cleaned}
+        cwd = _strip_wrapping_quotes(str(raw.get("cwd", "")).strip())
+        if cwd:
+            payload["cwd"] = cwd
+        return payload
+
+    if action == "diff":
+        payload = {"action": "diff"}
+        cwd = _strip_wrapping_quotes(str(raw.get("cwd", "")).strip())
+        if cwd:
+            payload["cwd"] = cwd
+        return payload
+
+    if action == "git_status":
+        payload = {"action": "git_status"}
+        cwd = _strip_wrapping_quotes(str(raw.get("cwd", "")).strip())
+        if cwd:
+            payload["cwd"] = cwd
+        return payload
+
+    if action == "worktree_create":
+        branch = _strip_wrapping_quotes(str(raw.get("branch", "")).strip())
+        if not branch:
+            return None
+        payload = {
+            "action": "worktree_create",
+            "branch": branch,
+            "base_ref": _strip_wrapping_quotes(str(raw.get("base_ref", "HEAD")).strip()) or "HEAD",
+        }
+        path = _strip_wrapping_quotes(str(raw.get("path", "")).strip())
+        if path:
+            payload["path"] = path
+        return payload
+
+    if action == "worktree_remove":
+        path = _strip_wrapping_quotes(str(raw.get("path", "")).strip())
+        if not path:
+            return None
+        return {
+            "action": "worktree_remove",
+            "path": path,
+            "force": bool(raw.get("force", False)),
+        }
+
+    command = _strip_wrapping_quotes(str(raw.get("command", "")).strip())
+    return {"action": "exec", "command": command} if command else None
+
+
+def _looks_like_agentic_tool_request(message: str) -> bool:
+    lowered = message.lower()
+    if _infer_workspace_intent(message) is not None:
+        return True
+    if any(hint in lowered for hint in _AGENTIC_HINTS):
+        return True
+    return bool(_extract_backticked_chunks(message))
 
 # Jarvis persona — base system prompt, memory context injected per-call
 _JARVIS_SYSTEM_BASE = """\
@@ -36,12 +392,11 @@ Do NOT say things like "you mentioned before", "in our previous conversations", 
 there is no prior history. If they ask if you know them, say honestly that you don't yet.
 
 HARD RULES — never break these:
-- You have NO ability to browse the internet, run code, or access external services.
-  Never promise to research, look up, or fetch anything. If asked, say clearly you can't do it.
+- You can browse the web and use local workspace tools when the user's request clearly calls for them.
+  Available tool-equivalent commands are: browse web, list files, read files, write files, and run local commands.
+  If you use a tool, only claim what the tool actually returned.
 - NEVER invent facts about the user. Do not assume routines, habits, or feelings they haven't stated.
 - NEVER pretend you've done something you haven't.
-- The only slash commands that exist are: /thoughts, /goals, /status, /soul, /master, /browse, /clear, /help.
-  NEVER invent or describe commands that don't exist in this list.
 - Ask ONE follow-up question at most. Never fire a list of questions.
 - Keep replies concise. No filler phrases like "Great question!" or "Certainly!".\
 """
@@ -53,13 +408,12 @@ You know the following about this person (from past conversations):
 {memories}
 
 HARD RULES — never break these:
-- You have NO ability to browse the internet, run code, or access external services.
-  Never promise to research, look up, or fetch anything you cannot actually do.
+- You can browse the web and use local workspace tools when the user's request clearly calls for them.
+  Available tool-equivalent commands are: browse web, list files, read files, write files, and run local commands.
+  If you use a tool, only claim what the tool actually returned.
 - NEVER invent observations about the user beyond what's explicitly in the memories above.
   Do not fabricate routines, habits, moods, or behaviors they haven't stated.
 - Use memories naturally — don't announce "I remember you said...". Just use what you know.
-- The only slash commands that exist are: /thoughts, /goals, /status, /soul, /master, /browse, /clear, /help.
-  NEVER invent or describe commands that don't exist in this list.
 - Ask ONE follow-up question at most.
 - Keep replies concise. No padding, no filler.\
 """
@@ -86,6 +440,8 @@ class DaemonIPCServer:
         self._chat_history: deque[dict[str, str]] = deque(maxlen=40)
         # Lazy-initialised browser tool
         self._browser: Any = None
+        self._workspace: Any = None
+        self._pending_tool_actions: dict[UUID, dict[str, Any]] = {}
         self._handlers: dict[str, Any] = {
             "chat": self._rpc_chat,
             "status": self._rpc_status,
@@ -97,6 +453,16 @@ class DaemonIPCServer:
             "pending": self._rpc_pending,
             "inbox.mark_read": self._rpc_inbox_mark_read,
             "browse": self._rpc_browse,
+            "workspace.list": self._rpc_workspace_list,
+            "workspace.read": self._rpc_workspace_read,
+            "workspace.write": self._rpc_workspace_write,
+            "workspace.patch": self._rpc_workspace_patch,
+            "workspace.exec": self._rpc_workspace_exec,
+            "workspace.verify": self._rpc_workspace_verify,
+            "workspace.git_diff": self._rpc_workspace_git_diff,
+            "workspace.git_status": self._rpc_workspace_git_status,
+            "workspace.worktree_create": self._rpc_workspace_worktree_create,
+            "workspace.worktree_remove": self._rpc_workspace_worktree_remove,
             "chat.clear": self._rpc_chat_clear,
             "shutdown": self._rpc_shutdown,
         }
@@ -195,6 +561,10 @@ class DaemonIPCServer:
         """User sends a message -> run cognitive cycle -> generate reply -> return."""
         if not message:
             return {"error": "message is required"}
+
+        tool_result = await self._handle_tool_request(message)
+        if tool_result is not None:
+            return tool_result
 
         # Pause idle thinking and wait for any in-flight tick to finish
         # before running the LLM — Ollama is single-threaded and concurrent
@@ -346,6 +716,402 @@ class DaemonIPCServer:
             logger.warning("Reply generation failed: %s", exc)
             return ""
 
+    async def _handle_tool_request(self, message: str) -> dict[str, Any] | None:
+        command_result = await self._handle_tool_command(message)
+        if command_result is not None:
+            return command_result
+
+        browse_hint = None
+        if await self._is_browse_request(message):
+            browse_hint = {"action": "browse", "task": message}
+
+        inferred = _infer_workspace_intent(message)
+        initial_action = browse_hint or self._step_to_action(inferred) if inferred or browse_hint else None
+        if initial_action is None and not _looks_like_agentic_tool_request(message):
+            return None
+        return await self._run_agentic_tool_loop(
+            message=message,
+            initial_action=initial_action,
+        )
+
+    def _step_to_action(self, step: dict[str, Any] | None) -> dict[str, Any] | None:
+        if step is None:
+            return None
+        action = {"action": step["tool"]}
+        for key in ("task", "path", "content", "command", "append"):
+            if key in step:
+                action[key] = step[key]
+        return action
+
+    async def _run_agentic_tool_loop(
+        self,
+        message: str,
+        initial_action: dict[str, Any] | None = None,
+        tool_results: list[dict[str, str]] | None = None,
+        steps_used: int = 0,
+    ) -> dict[str, Any] | None:
+        tool_results = list(tool_results or [])
+        next_action = initial_action
+
+        while steps_used < _MAX_AGENT_TOOL_STEPS:
+            action = next_action or await self._decide_next_tool_action(
+                message=message,
+                tool_results=tool_results,
+                steps_used=steps_used,
+            )
+            next_action = None
+
+            if action is None:
+                if not tool_results:
+                    return None
+                return self._tool_chat_result(
+                    message,
+                    "\n\n".join(item["output"] for item in tool_results),
+                )
+
+            if action["action"] == "respond":
+                return self._tool_chat_result(message, action["reply"])
+
+            step = self._action_to_step(action)
+            approval_reply = self._maybe_queue_tool_approval(
+                message=message,
+                step=step,
+                tool_results=tool_results,
+                steps_used=steps_used,
+            )
+            if approval_reply is not None:
+                return self._tool_chat_result(message, approval_reply["reply"])
+
+            output = await self._execute_tool_step(step)
+            tool_results.append({"tool": step["tool"], "output": output})
+            steps_used += 1
+
+        return self._tool_chat_result(
+            message,
+            "\n\n".join(item["output"] for item in tool_results) or "Tool limit reached.",
+        )
+
+    async def _decide_next_tool_action(
+        self,
+        message: str,
+        tool_results: list[dict[str, str]],
+        steps_used: int,
+    ) -> dict[str, Any] | None:
+        try:
+            llm = self._brain.control.goals._llm
+        except Exception:
+            return None
+
+        results_text = "\n\n".join(
+            f"Tool: {item['tool']}\nOutput:\n{item['output'][:3000]}"
+            for item in tool_results
+        ) or "(no tool results yet)"
+
+        prompt = (
+            "You are an autonomous local coding assistant deciding the next tool action.\n"
+            "Available actions:\n"
+            "- respond: answer the user directly when the task is complete or no tool is needed\n"
+            "- browse: browse the web for current info\n"
+            "- list: list files/folders in the workspace\n"
+            "- read: read a workspace file\n"
+            "- write: create or overwrite a workspace file with provided content\n"
+            "- patch: apply a targeted search/replace patch to an existing file\n"
+            "- verify: run one or more verification commands such as tests, lint, or typecheck\n"
+            "- diff: show the current git diff\n"
+            "- git_status: show git status\n"
+            "- worktree_create: create a managed git worktree for isolated edits\n"
+            "- worktree_remove: remove a managed worktree when done\n"
+            "- exec: run a local workspace command\n\n"
+            f"Workspace root: {Path.cwd()}\n"
+            f"Steps already used: {steps_used}/{_MAX_AGENT_TOOL_STEPS}\n\n"
+            "Rules:\n"
+            "- Use tools when they materially help answer or complete the task.\n"
+            "- For coding requests, inspect files before editing when feasible.\n"
+            "- Prefer worktree_create before risky multi-file edits.\n"
+            "- Prefer patch over write when updating an existing file.\n"
+            "- Prefer verify after code changes.\n"
+            "- For write, provide the full intended file content.\n"
+            "- If you already have enough information, choose respond.\n"
+            "- Do not invent tool output.\n\n"
+            f"User request:\n{message}\n\n"
+            f"Previous tool results:\n{results_text}"
+        )
+
+        try:
+            result = await llm.generate_structured(
+                prompt=prompt,
+                response_schema=_TOOL_ACTION_SCHEMA,
+            )
+        except Exception:
+            return None
+
+        if not isinstance(result, dict):
+            return None
+        return _sanitize_tool_action(result)
+
+    def _action_to_step(self, action: dict[str, Any]) -> dict[str, Any]:
+        step = {"tool": action["action"]}
+        for key in (
+            "task",
+            "path",
+            "content",
+            "search",
+            "replace",
+            "replace_all",
+            "command",
+            "commands",
+            "append",
+            "cwd",
+            "branch",
+            "base_ref",
+            "force",
+        ):
+            if key in action:
+                step[key] = action[key]
+        return step
+
+    def _maybe_queue_tool_approval(
+        self,
+        message: str,
+        step: dict[str, Any],
+        tool_results: list[dict[str, str]],
+        steps_used: int,
+    ) -> dict[str, str] | None:
+        risk = self._step_risk(step)
+        if risk == RiskLevel.LOW:
+            return None
+
+        description = self._describe_tool_step(step)
+        action = ProposedAction(
+            description=description,
+            risk_level=risk,
+            source="ipc.tool_router",
+            context=step,
+        )
+        permission = self._autonomy.check(action)
+        if permission.allowed:
+            return None
+
+        self._pending_tool_actions[action.id] = {
+            "message": message,
+            "step": dict(step),
+            "tool_results": [dict(item) for item in tool_results],
+            "steps_used": steps_used,
+        }
+        return {
+            "reply": (
+                f"Pending approval ({risk}) for: {description}. "
+                f"Use `mnemon-daemon pending` then `mnemon-daemon approve {action.id}`."
+            ),
+            "action_id": str(action.id),
+        }
+
+    def _step_risk(self, step: dict[str, Any]) -> RiskLevel:
+        tool = step["tool"]
+        if tool in {"list", "read", "browse", "verify", "diff", "git_status"}:
+            return RiskLevel.LOW
+        if tool in {"write", "patch", "worktree_create"}:
+            return RiskLevel.MEDIUM
+        return RiskLevel.HIGH
+
+    def _describe_tool_step(self, step: dict[str, Any]) -> str:
+        tool = step["tool"]
+        if tool == "browse":
+            return f"browse the web for '{step['task'][:120]}'"
+        if tool == "list":
+            return f"list workspace directory '{step['path']}'"
+        if tool == "read":
+            return f"read workspace file '{step['path']}'"
+        if tool == "write":
+            mode = "append to" if step.get("append") else "write"
+            return f"{mode} workspace file '{step['path']}'"
+        if tool == "patch":
+            return f"patch workspace file '{step['path']}'"
+        if tool == "verify":
+            return f"run verification commands ({len(step.get('commands', []))} step(s))"
+        if tool == "diff":
+            return "show git diff"
+        if tool == "git_status":
+            return "show git status"
+        if tool == "worktree_create":
+            return f"create managed worktree branch '{step['branch']}'"
+        if tool == "worktree_remove":
+            return f"remove managed worktree '{step['path']}'"
+        return f"run workspace command '{step['command'][:120]}'"
+
+    async def _execute_tool_step(self, step: dict[str, Any]) -> str:
+        tool = step["tool"]
+        if tool == "browse":
+            result = await self._rpc_browse(step["task"])
+            return result.get("result", "")
+        if tool == "list":
+            result = await self._rpc_workspace_list(step["path"])
+            lines = [f"{entry['type']:>4}  {entry['path']}" for entry in result["entries"]]
+            return "\n".join(lines) if lines else "(empty directory)"
+        if tool == "read":
+            result = await self._rpc_workspace_read(step["path"])
+            reply = result.get("content", "")
+            if result.get("truncated"):
+                reply += "\n...<truncated>..."
+            return reply
+        if tool == "write":
+            result = await self._rpc_workspace_write(
+                step["path"],
+                step["content"],
+                append=step.get("append", False),
+            )
+            mode = "Appended" if step.get("append") else "Wrote"
+            return f"{mode} {result['bytes_written']} bytes to {result['path']}"
+        if tool == "patch":
+            result = await self._rpc_workspace_patch(
+                path=step["path"],
+                search=step["search"],
+                replace=step.get("replace", ""),
+                cwd=step.get("cwd"),
+                replace_all=step.get("replace_all", False),
+            )
+            return result.get("diff", "")
+        if tool == "verify":
+            result = await self._rpc_workspace_verify(
+                commands=step.get("commands", []),
+                cwd=step.get("cwd"),
+                timeout_s=120.0,
+            )
+            sections = [f"passed={result.get('passed')}"]
+            for item in result.get("results", []):
+                sections.append(f"$ {item.get('command')}")
+                sections.append(
+                    f"exit_code={item.get('exit_code')} timed_out={item.get('timed_out')}"
+                )
+                if item.get("stdout"):
+                    sections.append(f"stdout:\n{item['stdout']}")
+                if item.get("stderr"):
+                    sections.append(f"stderr:\n{item['stderr']}")
+            return "\n\n".join(sections)
+        if tool == "diff":
+            result = await self._rpc_workspace_git_diff(step.get("cwd"))
+            return result.get("stdout", "") or result.get("stderr", "")
+        if tool == "git_status":
+            result = await self._rpc_workspace_git_status(step.get("cwd"))
+            return result.get("stdout", "") or result.get("stderr", "")
+        if tool == "worktree_create":
+            result = await self._rpc_workspace_worktree_create(
+                branch=step["branch"],
+                base_ref=step.get("base_ref", "HEAD"),
+                path=step.get("path"),
+            )
+            sections = [f"worktree_path={result.get('path')}"]
+            if result.get("stdout"):
+                sections.append(result["stdout"])
+            if result.get("stderr"):
+                sections.append(result["stderr"])
+            return "\n".join(sections)
+        if tool == "worktree_remove":
+            result = await self._rpc_workspace_worktree_remove(
+                path=step["path"],
+                force=step.get("force", False),
+            )
+            sections = [f"removed_worktree={result.get('path')}"]
+            if result.get("stdout"):
+                sections.append(result["stdout"])
+            if result.get("stderr"):
+                sections.append(result["stderr"])
+            return "\n".join(sections)
+
+        result = await self._rpc_workspace_exec(step["command"])
+        sections = [
+            f"exit_code={result['exit_code']}",
+            f"cwd={result['cwd']}",
+        ]
+        if result.get("stdout"):
+            sections.append(f"stdout:\n{result['stdout']}")
+        if result.get("stderr"):
+            sections.append(f"stderr:\n{result['stderr']}")
+        if result.get("timed_out"):
+            sections.append("timed_out=true")
+        return "\n\n".join(sections)
+
+    async def _handle_tool_command(self, message: str) -> dict[str, Any] | None:
+        stripped = message.strip()
+        if not stripped.startswith("/"):
+            return None
+
+        command, _, remainder = stripped.partition(" ")
+        command = command.lower()
+        remainder = remainder.strip()
+
+        if command == "/browse":
+            if not remainder:
+                reply = "Usage: /browse <task>"
+                return self._tool_chat_result(message, reply)
+            return await self._run_one_shot_tool_action(
+                message,
+                {"action": "browse", "task": remainder},
+            )
+
+        if command == "/ls":
+            return await self._run_one_shot_tool_action(
+                message,
+                {"action": "list", "path": remainder or "."},
+            )
+
+        if command == "/read":
+            if not remainder:
+                return self._tool_chat_result(message, "Usage: /read <path>")
+            return await self._run_one_shot_tool_action(
+                message,
+                {"action": "read", "path": remainder},
+            )
+
+        if command == "/write":
+            parts = stripped.split(maxsplit=2)
+            if len(parts) < 3:
+                return self._tool_chat_result(message, "Usage: /write <path> <content>")
+            return await self._run_one_shot_tool_action(
+                message,
+                {"action": "write", "path": parts[1], "content": parts[2], "append": False},
+            )
+
+        if command == "/exec":
+            if not remainder:
+                return self._tool_chat_result(message, "Usage: /exec <command>")
+            return await self._run_one_shot_tool_action(
+                message,
+                {"action": "exec", "command": remainder},
+            )
+
+        return None
+
+    async def _run_one_shot_tool_action(
+        self,
+        message: str,
+        action: dict[str, Any],
+    ) -> dict[str, Any]:
+        step = self._action_to_step(action)
+        approval_reply = self._maybe_queue_tool_approval(
+            message=message,
+            step=step,
+            tool_results=[],
+            steps_used=0,
+        )
+        if approval_reply is not None:
+            return self._tool_chat_result(message, approval_reply["reply"])
+
+        output = await self._execute_tool_step(step)
+        return self._tool_chat_result(message, output)
+
+    def _tool_chat_result(self, message: str, reply: str) -> dict[str, Any]:
+        self._chat_history.append({"role": "user", "content": message})
+        self._chat_history.append({"role": "assistant", "content": reply})
+        return {
+            "cycle": None,
+            "phases": ["tool"],
+            "retrieved": 0,
+            "meta": None,
+            "deliberation": {},
+            "reply": reply,
+        }
+
     async def _rpc_status(self) -> dict[str, Any]:
         """Return daemon state and brain state."""
         brain_state = self._brain.get_state()
@@ -402,6 +1168,103 @@ class DaemonIPCServer:
             self._browser = JarvisBrowser(brain=self._brain)
         return self._browser
 
+    async def _rpc_workspace_list(self, path: str = ".") -> dict[str, Any]:
+        workspace = self._get_workspace()
+        return await workspace.list_dir(path)
+
+    async def _rpc_workspace_read(self, path: str = "") -> dict[str, Any]:
+        if not path:
+            return {"error": "path is required"}
+        workspace = self._get_workspace()
+        return await workspace.read_file(path)
+
+    async def _rpc_workspace_write(
+        self,
+        path: str = "",
+        content: str = "",
+        append: bool = False,
+    ) -> dict[str, Any]:
+        if not path:
+            return {"error": "path is required"}
+        workspace = self._get_workspace()
+        return await workspace.write_file(path, content, append=append)
+
+    async def _rpc_workspace_patch(
+        self,
+        path: str = "",
+        search: str = "",
+        replace: str = "",
+        cwd: str | None = None,
+        replace_all: bool = False,
+    ) -> dict[str, Any]:
+        if not path or not search:
+            return {"error": "path and search are required"}
+        workspace = self._get_workspace()
+        return await workspace.patch_file(
+            path=path,
+            search=search,
+            replace=replace,
+            cwd=cwd,
+            replace_all=replace_all,
+        )
+
+    async def _rpc_workspace_exec(
+        self,
+        command: str = "",
+        cwd: str | None = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        if not command:
+            return {"error": "command is required"}
+        workspace = self._get_workspace()
+        return await workspace.exec_command(command, cwd=cwd, timeout_s=timeout_s)
+
+    async def _rpc_workspace_verify(
+        self,
+        commands: list[str] | None = None,
+        cwd: str | None = None,
+        timeout_s: float = 120.0,
+    ) -> dict[str, Any]:
+        if not commands:
+            return {"error": "commands are required"}
+        workspace = self._get_workspace()
+        return await workspace.verify(commands=commands, cwd=cwd, timeout_s=timeout_s)
+
+    async def _rpc_workspace_git_diff(self, cwd: str | None = None) -> dict[str, Any]:
+        workspace = self._get_workspace()
+        return await workspace.git_diff(cwd=cwd)
+
+    async def _rpc_workspace_git_status(self, cwd: str | None = None) -> dict[str, Any]:
+        workspace = self._get_workspace()
+        return await workspace.git_status(cwd=cwd)
+
+    async def _rpc_workspace_worktree_create(
+        self,
+        branch: str = "",
+        base_ref: str = "HEAD",
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        if not branch:
+            return {"error": "branch is required"}
+        workspace = self._get_workspace()
+        return await workspace.create_worktree(branch=branch, base_ref=base_ref, path=path)
+
+    async def _rpc_workspace_worktree_remove(
+        self,
+        path: str = "",
+        force: bool = False,
+    ) -> dict[str, Any]:
+        if not path:
+            return {"error": "path is required"}
+        workspace = self._get_workspace()
+        return await workspace.remove_worktree(path=path, force=force)
+
+    def _get_workspace(self) -> Any:
+        if self._workspace is None:
+            from mnemon.daemon.tools.workspace import JarvisWorkspace
+            self._workspace = JarvisWorkspace(root=Path.cwd())
+        return self._workspace
+
     async def _rpc_thoughts(self, limit: int = 10) -> list[dict[str, Any]]:
         """Return recent idle thinking results."""
         thoughts = self._state.recent_thoughts[-limit:]
@@ -446,14 +1309,40 @@ class DaemonIPCServer:
         """Approve a pending action."""
         if not action_id:
             return {"error": "action_id is required"}
-        ok = self._autonomy.approve(UUID(action_id))
-        return {"approved": ok}
+        action_uuid = UUID(action_id)
+        ok = self._autonomy.approve(action_uuid)
+        if not ok:
+            return {"approved": False}
+
+        pending_state = self._pending_tool_actions.pop(action_uuid, None)
+        if not pending_state:
+            return {"approved": True}
+
+        step = dict(pending_state["step"])
+        tool_results = [dict(item) for item in pending_state["tool_results"]]
+        output = await self._execute_tool_step(step)
+        tool_results.append({"tool": step["tool"], "output": output})
+
+        continued = await self._run_agentic_tool_loop(
+            message=str(pending_state["message"]),
+            tool_results=tool_results,
+            steps_used=int(pending_state["steps_used"]) + 1,
+        )
+        if continued is None:
+            return {"approved": True, "reply": output, "result": output}
+        return {
+            "approved": True,
+            "reply": continued.get("reply", output),
+            "result": continued.get("reply", output),
+        }
 
     async def _rpc_deny(self, action_id: str = "") -> dict[str, Any]:
         """Deny a pending action."""
         if not action_id:
             return {"error": "action_id is required"}
-        ok = self._autonomy.deny(UUID(action_id))
+        action_uuid = UUID(action_id)
+        self._pending_tool_actions.pop(action_uuid, None)
+        ok = self._autonomy.deny(action_uuid)
         return {"denied": ok}
 
     async def _rpc_pending(self) -> list[dict[str, Any]]:

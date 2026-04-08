@@ -155,7 +155,7 @@ class JarvisIdentity:
         path.write_text(text, encoding="utf-8")
 
     def _append_to_section(self, path: Path, section: str, content: str) -> None:
-        """Append content under a specific section header."""
+        """Append content under a specific section header, skipping near-duplicates."""
         text = path.read_text(encoding="utf-8")
         header = f"# {section}"
         content = content.strip()
@@ -166,7 +166,6 @@ class JarvisIdentity:
         else:
             # Find section and append before the next header
             idx = text.index(header) + len(header)
-            # Find the next section or end of file
             rest = text[idx:]
             next_header_pos = len(rest)
             for i, line in enumerate(rest.split("\n")):
@@ -176,6 +175,26 @@ class JarvisIdentity:
 
             section_content = rest[:next_header_pos].rstrip()
             remainder = rest[next_header_pos:]
+
+            # Deduplicate: skip if first 80 chars already appear in section
+            fingerprint = content[:80].lower()
+            if fingerprint and fingerprint in section_content.lower():
+                logger.debug("Skipping duplicate entry in %s / %s", path.name, section)
+                return
+
+            # Also skip if word-level similarity >70% with any existing bullet
+            existing_bullets = [
+                l.lstrip("- ").strip() for l in section_content.split("\n")
+                if l.strip().startswith("- ")
+            ]
+            new_words = set(content.lower().split())
+            for existing in existing_bullets:
+                ex_words = set(existing.lower().split())
+                if new_words and ex_words:
+                    overlap = len(new_words & ex_words) / max(len(new_words), len(ex_words))
+                    if overlap > 0.7:
+                        logger.debug("Skipping similar entry (%.0f%% overlap) in %s / %s", overlap * 100, path.name, section)
+                        return
 
             # Remove stale placeholder lines
             placeholders = ("(Nothing", "(Unknown", "(None yet", "(No ")

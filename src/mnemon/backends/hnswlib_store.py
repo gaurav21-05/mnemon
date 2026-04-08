@@ -221,6 +221,18 @@ class HNSWLibVectorStore(VectorStore):
             return 0
         return self._index.get_current_count()
 
+    async def clear(self) -> None:
+        """Remove all vectors and delete persisted index files."""
+        self._reset()
+        for path_str in (self._index_path, self._meta_path):
+            path = Path(path_str)
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError as exc:
+                logger.warning("HNSWLibVectorStore.clear could not remove %s: %s", path, exc)
+        logger.debug("HNSWLibVectorStore.clear index=%s", self._index_path)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

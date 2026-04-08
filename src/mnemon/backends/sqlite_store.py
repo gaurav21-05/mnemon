@@ -71,7 +71,12 @@ class SQLiteDocumentStore(DocumentStore):
         await store.close()
     """
 
-    def __init__(self, config: MnemonConfig) -> None:
+    def __init__(
+        self,
+        config: MnemonConfig,
+        db_path: str | None = None,
+        table_name: str | None = None,
+    ) -> None:
         """Prepare settings but do not open a database connection.
 
         Parameters
@@ -80,13 +85,19 @@ class SQLiteDocumentStore(DocumentStore):
             Root Mnemon configuration.  SQLite-specific settings are read from
             ``config.model_extra`` if present; otherwise defaults are used.
             Supported extra keys: ``sqlite_db_path``, ``sqlite_table_name``.
+        db_path:
+            Explicit path to the SQLite database file.  When provided, takes
+            precedence over ``config.model_extra["sqlite_db_path"]``.
+        table_name:
+            Explicit table name.  When provided, takes precedence over
+            ``config.model_extra["sqlite_table_name"]``.
         """
         extra: dict[str, Any] = {}
         if hasattr(config, "model_extra") and config.model_extra:
             extra = config.model_extra
 
-        self._db_path: str = str(extra.get("sqlite_db_path", "mnemon_documents.db"))
-        self._table_name: str = str(extra.get("sqlite_table_name", "documents"))
+        self._db_path: str = db_path or str(extra.get("sqlite_db_path", "mnemon_documents.db"))
+        self._table_name: str = table_name or str(extra.get("sqlite_table_name", "documents"))
 
         # Validate table name to prevent SQL injection — only alphanumeric + underscore
         if not self._table_name or not all(
@@ -125,6 +136,8 @@ class SQLiteDocumentStore(DocumentStore):
             return
 
         try:
+            from pathlib import Path
+            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
             self._db = await aiosqlite.connect(self._db_path)
             self._db.row_factory = aiosqlite.Row
 

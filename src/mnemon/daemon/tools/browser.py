@@ -193,7 +193,7 @@ class JarvisBrowser:
                 tags=["web_research", "browsing"],
                 importance=0.7,
             )
-            await self._brain.memory.episodic.store(episode)
+            await self._brain.memory.episodic.encode(episode)
             logger.info("Stored browsing result as episode: %s", task[:60])
         except Exception as exc:
             logger.warning("Failed to store browsing result: %s", exc)

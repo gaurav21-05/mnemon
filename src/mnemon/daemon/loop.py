@@ -211,6 +211,15 @@ class IdleThinkingLoop:
                 return True
         return False
 
+    @staticmethod
+    def _conversation_text(ep: Any) -> str:
+        """Prefer the user's raw utterance stored in action over episodic context."""
+        action = getattr(ep, "action", "") or ""
+        if action.strip():
+            return action.strip()
+        context = getattr(ep, "context", "") or ""
+        return context.strip()
+
     # ------------------------------------------------------------------
     # Priority 1: Help my master
     # ------------------------------------------------------------------
@@ -239,15 +248,19 @@ class IdleThinkingLoop:
             for doc in all_docs:
                 try:
                     ep = _Episode.model_validate(doc)
-                    if (ep.context and len(ep.context.strip()) > 30
-                            and ep.context.strip() not in ("", "(empty)")
-                            and not ep.context.startswith("http")):
+                    user_text = self._conversation_text(ep)
+                    if (user_text and len(user_text) > 10
+                            and user_text not in ("", "(empty)")
+                            and not user_text.startswith("http")):
                         conversations.append(ep)
                 except Exception:
                     pass
 
             recent_convs = sorted(conversations, key=lambda e: e.timestamp, reverse=True)[:5]
-            conv_context = "\n".join(f"- {ep.context[:300]}" for ep in recent_convs)
+            conv_context = "\n".join(
+                f"- {self._conversation_text(ep)[:300]}"
+                for ep in recent_convs
+            )
 
             goals_context = ""
             if active_goals:
@@ -350,9 +363,10 @@ class IdleThinkingLoop:
             for doc in all_docs:
                 try:
                     ep = _Episode.model_validate(doc)
-                    if (ep.context and len(ep.context.strip()) > 30
-                            and ep.context.strip() not in ("", "(empty)")
-                            and not ep.context.startswith("http")):
+                    user_text = self._conversation_text(ep)
+                    if (user_text and len(user_text) > 10
+                            and user_text not in ("", "(empty)")
+                            and not user_text.startswith("http")):
                         episodes.append(ep)
                 except Exception:
                     pass
@@ -374,7 +388,10 @@ class IdleThinkingLoop:
                 self._master_episode_ids.add(str(ep.id))
 
             recent = sorted(available, key=lambda e: e.timestamp, reverse=True)[:8]
-            conv_context = "\n".join(f"- {ep.context[:300]}" for ep in recent)
+            conv_context = "\n".join(
+                f"- {self._conversation_text(ep)[:300]}"
+                for ep in recent
+            )
 
             current_profile = self._identity.read_master() if self._identity else ""
 
@@ -419,8 +436,8 @@ class IdleThinkingLoop:
                     ep1, ep2 = random.sample(recent[:min(8, len(recent))], 2)
                     prompt = (
                         "You are Jarvis, noticing connections in your master's behavior.\n\n"
-                        f"Thing 1: {ep1.context[:300]}\n"
-                        f"Thing 2: {ep2.context[:300]}\n\n"
+                        f"Thing 1: {self._conversation_text(ep1)[:300]}\n"
+                        f"Thing 2: {self._conversation_text(ep2)[:300]}\n\n"
                         "Is there a pattern here? Does one explain the other? "
                         "What does the combination tell you about this person? "
                         "1-2 sentences, specific."
@@ -428,7 +445,7 @@ class IdleThinkingLoop:
                 else:
                     prompt = (
                         "You are Jarvis. Your master told you: "
-                        f"'{recent[0].context[:300]}'\n\n"
+                        f"'{self._conversation_text(recent[0])[:300]}'\n\n"
                         "What does this reveal about them? 1 sentence."
                     )
                 section = "Patterns I've Noticed"
@@ -518,12 +535,26 @@ class IdleThinkingLoop:
                         f"- {g.description}" for g in active_goals[:3]
                     )
 
+                # Extract what Jarvis already decided to learn (to avoid repeating)
+                already_listed = ""
+                want_section = ""
+                if soul:
+                    for line in soul.split("\n"):
+                        if line.startswith("# What I Want"):
+                            want_section = "start"
+                            continue
+                        if want_section == "start" and line.startswith("# "):
+                            break
+                        if want_section == "start" and line.strip().startswith("- "):
+                            already_listed += line.strip() + "\n"
+
                 prompt = (
                     "You are Jarvis, planning your own development.\n\n"
                     f"Your current knowledge:\n{learnings[:400]}\n\n"
                     f"{goals_ctx}\n\n"
-                    "What should you learn next to become more useful to your master? "
-                    "Name something specific: a domain, a skill, a concept, a tool. "
+                    + (f"You've already decided to learn:\n{already_listed}\nDon't repeat these.\n\n" if already_listed else "")
+                    + "What should you learn NEXT to become more useful to your master? "
+                    "Name something DIFFERENT and specific: a domain, a skill, a concept, a tool. "
                     "What would make you genuinely better at helping them? 1-2 sentences."
                 )
                 section_file = "soul"

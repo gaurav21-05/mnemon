@@ -11,14 +11,17 @@ pre-attentive icons in iconic/echoic memory (~30 s decay).
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from datetime import datetime, timezone
 
 from mnemon.core.config import SensoryConfig
 from mnemon.core.interfaces import SensoryBufferInterface
-from mnemon.core.models import Modality, PerceptUnit
+from mnemon.core.models import Entity, Modality, PerceptUnit
 
 logger = logging.getLogger(__name__)
+
+_ENTITY_PATTERN = re.compile(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*|[A-Z]{2,})\b")
 
 
 class SensoryBuffer(SensoryBufferInterface):
@@ -65,6 +68,19 @@ class SensoryBuffer(SensoryBufferInterface):
                 len(live),
             )
 
+    def _extract_entities(self, raw_input: str) -> list[Entity]:
+        """Cheap heuristic NER fallback using title-case and acronym spans."""
+        seen: set[str] = set()
+        entities: list[Entity] = []
+        for match in _ENTITY_PATTERN.findall(raw_input):
+            canonical = match.strip()
+            normalized = canonical.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            entities.append(Entity(canonical_name=canonical, type="unknown"))
+        return entities
+
     # ------------------------------------------------------------------
     # SensoryBufferInterface implementation
     # ------------------------------------------------------------------
@@ -92,7 +108,7 @@ class SensoryBuffer(SensoryBufferInterface):
             normalized=normalized,
             tokens=token_count,
             embedding=None,
-            entities=[],
+            entities=self._extract_entities(raw_input) if modality == Modality.TEXT else [],
             sentiment=0.0,
             ttl_ms=self._config.ttl_ms,
         )

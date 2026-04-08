@@ -179,7 +179,7 @@ class EpisodicConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MNEMON__EPISODIC__", env_nested_delimiter="__")
 
     backend: str = Field(
-        default="qdrant",
+        default="hnswlib",
         description="Vector store backend identifier (e.g. 'qdrant', 'hnswlib', 'memory').",
     )
     retrieval_weights: EpisodicRetrievalWeights = Field(
@@ -253,8 +253,8 @@ class SemanticConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MNEMON__SEMANTIC__", env_nested_delimiter="__")
 
     graph_backend: str = Field(
-        default="falkordb",
-        description="Graph database backend identifier (e.g. 'falkordb', 'neo4j', 'memory').",
+        default="igraph",
+        description="Graph database backend identifier (e.g. 'falkordb', 'neo4j', 'igraph', 'memory').",
     )
     raptor: RaptorConfig = Field(default_factory=RaptorConfig)
     community_detection: CommunityDetectionConfig = Field(
@@ -414,6 +414,11 @@ class ConsolidationConfig(BaseSettings):
         default=32,
         ge=1,
         description="Number of episodes processed per consolidation batch.",
+    )
+    max_extraction_retries: int = Field(
+        default=3,
+        ge=1,
+        description="Maximum failed LLM extraction attempts before an episode is marked failed.",
     )
     replay: ReplayConfig = Field(default_factory=ReplayConfig)
 

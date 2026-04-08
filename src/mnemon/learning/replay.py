@@ -250,17 +250,32 @@ class PrioritizedReplayBuffer:
             high = segment * (i + 1)
             value = random.uniform(low, high)  # noqa: S311 — not security-sensitive
             # Clamp to avoid floating-point overshoot past root sum
-            value = min(value, total - 1e-9)
+            value = max(0.0, min(value, total - 1e-9))
             tree_index, priority, episode_id = self._tree.sample(value)
-            experiences.append(
-                ReplayExperience(
-                    episode_id=episode_id,
-                    tree_index=tree_index,
-                    priority=priority,
-                    is_weight=0.0,  # filled in below
+            # Guard against sampling an uninitialised or invalid leaf.
+            if episode_id is None:
+                logger.warning("sample: None episode_id at tree_index=%d", tree_index)
+                continue
+            try:
+                experiences.append(
+                    ReplayExperience(
+                        episode_id=episode_id,
+                        tree_index=tree_index,
+                        priority=priority,
+                        is_weight=0.0,  # filled in below
+                    )
                 )
-            )
+            except Exception:
+                logger.warning(
+                    "sample: ReplayExperience rejected episode_id=%r type=%s tree_index=%d",
+                    episode_id, type(episode_id).__name__, tree_index,
+                )
+                continue
             priorities.append(priority)
+
+        if not experiences:
+            logger.warning("sample: all sampled leaves were uninitialised — returning empty")
+            return []
 
         # Compute IS weights: w_i = (1/(N*P(i)))^beta, normalised by max weight
         min_prob = min(p / total for p in priorities)

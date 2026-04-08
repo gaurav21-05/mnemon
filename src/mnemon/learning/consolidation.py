@@ -193,10 +193,11 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                     experience.episode_id,
                 )
                 continue
-            if episode.consolidation_state == ConsolidationState.CONSOLIDATED:
+            if episode.consolidation_state != ConsolidationState.RAW:
                 logger.debug(
-                    "Episode %s already consolidated — skipping",
+                    "Episode %s not raw (state=%s) — skipping",
                     experience.episode_id,
+                    episode.consolidation_state,
                 )
                 continue
             valid_episodes.append((episode, experience.tree_index, experience.priority))
@@ -226,6 +227,8 @@ class ConsolidationEngine(ConsolidationEngineInterface):
 
         # Maps episode_id → extracted triples for that episode.
         episode_triples: dict[UUID, list[SemanticTriple]] = {}
+        extracted_episode_ids: set[UUID] = set()
+        failed_extractions: dict[UUID, int] = {}
 
         for episode, tree_index, priority in valid_episodes:
             prompt = (
@@ -245,15 +248,20 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                     response_schema=_TRIPLE_SCHEMA,
                 )
             except Exception as exc:  # noqa: BLE001
+                attempts = episode.consolidation_attempts + 1
                 logger.warning(
-                    "LLM extraction failed for episode %s — skipping. Error: %s",
+                    "LLM extraction failed for episode %s (attempt %d/%d) — skipping. Error: %s",
                     episode.id,
+                    attempts,
+                    self._config.max_extraction_retries,
                     exc,
                 )
                 episode_triples[episode.id] = []
+                failed_extractions[episode.id] = attempts
                 continue
 
             raw_triples: list[dict[str, Any]] = result.get("triples", [])
+            extracted_episode_ids.add(episode.id)
             logger.debug(
                 "Episode %s: LLM returned %d raw triples", episode.id, len(raw_triples)
             )
@@ -323,15 +331,20 @@ class ConsolidationEngine(ConsolidationEngineInterface):
 
         total_triples_written = 0
         total_entities_resolved = 0
+        upserted_episode_ids: set[UUID] = set()
 
         for episode, _tree_index, _priority in valid_episodes:
             triples = episode_triples.get(episode.id, [])
+            if episode.id not in extracted_episode_ids:
+                continue
             if not triples:
+                upserted_episode_ids.add(episode.id)
                 logger.debug("Episode %s: no triples to upsert", episode.id)
                 continue
             try:
                 written = await self._semantic.upsert_triples(triples)
                 total_triples_written += written
+                upserted_episode_ids.add(episode.id)
                 # Count distinct entity refs across subject and object fields.
                 entity_ids: set[UUID] = set()
                 for t in triples:
@@ -355,20 +368,9 @@ class ConsolidationEngine(ConsolidationEngineInterface):
         # ----------------------------------------------------------------
         # Stage 4: CLEANUP
         # ----------------------------------------------------------------
-        # Only mark episodes that had successful extraction AND upsert as
-        # consolidated.  Episodes where LLM extraction failed (empty triples)
-        # or upsert threw an exception must remain RAW for re-processing.
-        successfully_upserted: set[UUID] = set()
-        for episode, _ti, _pr in valid_episodes:
-            triples = episode_triples.get(episode.id, [])
-            if triples:
-                # Check the episode had triples AND wasn't already flagged
-                # as a failed upsert (which would have been caught above).
-                successfully_upserted.add(episode.id)
-
         processed_ids: list[UUID] = [
             ep.id for ep, _, _ in valid_episodes
-            if ep.id in successfully_upserted
+            if ep.id in upserted_episode_ids
         ]
         logger.info(
             "Stage 4 (CLEANUP): marking %d/%d episodes consolidated",
@@ -386,6 +388,21 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                 f"Failed to mark episodes consolidated: {exc}"
             ) from exc
 
+        for episode_id in processed_ids:
+            await self._episodic.update(episode_id, consolidation_attempts=0)
+
+        for episode_id, attempts in failed_extractions.items():
+            next_state = (
+                ConsolidationState.FAILED
+                if attempts >= self._config.max_extraction_retries
+                else ConsolidationState.RAW
+            )
+            await self._episodic.update(
+                episode_id,
+                consolidation_attempts=attempts,
+                consolidation_state=next_state,
+            )
+
         # Update replay priorities.
         # Episodes that yielded many triples have had their information extracted;
         # lower priority so they are not replayed again soon.
@@ -398,6 +415,8 @@ class ConsolidationEngine(ConsolidationEngineInterface):
 
         for episode, tree_index, original_priority in valid_episodes:
             n_triples = len(episode_triples.get(episode.id, []))
+            if episode.id in failed_extractions:
+                continue
             # Normalised information-extracted fraction in [0, 1].
             extracted_fraction = n_triples / max_triples_in_batch
             # High extraction → low new priority; low extraction → keep high priority.

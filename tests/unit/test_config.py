@@ -56,7 +56,7 @@ def test_working_memory_defaults() -> None:
 
 def test_episodic_defaults() -> None:
     cfg = MnemonConfig()
-    assert cfg.episodic.backend == "qdrant"
+    assert cfg.episodic.backend == "hnswlib"
     weights = cfg.episodic.retrieval_weights
     assert abs(weights.semantic + weights.bm25 + weights.recency + weights.importance - 1.0) < 1e-6
     assert cfg.episodic.decay.base_lambda == pytest.approx(0.001)
@@ -91,7 +91,7 @@ def test_valence_defaults() -> None:
 
 def test_semantic_defaults() -> None:
     cfg = MnemonConfig()
-    assert cfg.semantic.graph_backend == "falkordb"
+    assert cfg.semantic.graph_backend == "igraph"
     assert cfg.semantic.raptor.enabled is True
     assert cfg.semantic.raptor.max_levels == 3
 

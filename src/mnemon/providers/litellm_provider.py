@@ -124,6 +124,42 @@ class LiteLLMProvider(LLMProvider):
             )
             raise
 
+    async def generate_chat(
+        self,
+        system: str,
+        history: list[dict[str, str]],
+        message: str,
+        **kwargs: Any,
+    ) -> str:
+        """Generate a reply using native multi-turn message API."""
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        for turn in history:
+            messages.append({"role": turn["role"], "content": turn["content"]})
+        messages.append({"role": "user", "content": message})
+
+        call_kwargs = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": kwargs.pop("temperature", self._temperature),
+            "max_tokens": kwargs.pop("max_tokens", self._max_tokens),
+            **self._kwargs,
+            **kwargs,
+        }
+        logger.debug(
+            "LiteLLMProvider.generate_chat: model=%s, turns=%d",
+            self._model,
+            len(messages),
+        )
+        try:
+            response = await acompletion(**call_kwargs)
+            content: str = response.choices[0].message.content or ""
+            return content.strip()
+        except Exception:
+            logger.exception(
+                "LiteLLMProvider.generate_chat failed (model=%s).", self._model
+            )
+            raise
+
     async def generate_structured(
         self,
         prompt: str,

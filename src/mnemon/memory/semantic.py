@@ -27,6 +27,7 @@ from mnemon.core.interfaces import (
     LLMProvider,
     RankedNode,
     SemanticMemoryInterface,
+    VectorItem,
     VectorStore,
 )
 from mnemon.core.models import (
@@ -77,6 +78,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
         self._docs = document_store
         self._embedder = embedding_provider
         self._llm = llm_provider
+        self._consistency_checked = False
         logger.debug(
             "SemanticMemoryStore initialised — graph_backend=%s llm=%s",
             config.graph_backend,
@@ -98,6 +100,136 @@ class SemanticMemoryStore(SemanticMemoryInterface):
     def _community_doc_id(self, community_id: UUID) -> UUID:
         """Stable document ID for a community record (same as community_id)."""
         return community_id
+
+    async def _query_docs_by_type(self, doc_type: str) -> list[dict[str, Any]]:
+        return await self._docs.query(filters={"_type": doc_type}, limit=100_000)
+
+    def _build_entity_metadata(self, doc: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "_type": _TYPE_ENTITY,
+            "entity_id": doc["entity_id"],
+            "canonical_name": doc["canonical_name"],
+        }
+
+    def _build_triple_metadata(self, doc: dict[str, Any]) -> dict[str, Any]:
+        obj = doc.get("object")
+        if isinstance(obj, dict):
+            object_name = obj.get("name", "")
+        else:
+            object_name = str(obj)
+        subject = doc.get("subject", {})
+        return {
+            "triple_id": doc["id"],
+            "predicate": doc.get("predicate", ""),
+            "subject_name": subject.get("name", "") if isinstance(subject, dict) else "",
+            "object_name": object_name,
+            "_type": _TYPE_TRIPLE,
+        }
+
+    def _build_cluster_metadata(self, doc: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "_type": _TYPE_CLUSTER,
+            "cluster_id": doc["id"],
+            "level": doc.get("level", 0),
+        }
+
+    async def _expected_vector_items(self) -> list[VectorItem]:
+        items: list[VectorItem] = []
+
+        for doc in await self._query_docs_by_type(_TYPE_ENTITY):
+            embedding = doc.get("embedding")
+            if embedding is None:
+                continue
+            items.append(
+                VectorItem(
+                    id=UUID(str(doc["id"])),
+                    embedding=embedding,
+                    metadata=self._build_entity_metadata(doc),
+                )
+            )
+
+        for doc in await self._query_docs_by_type(_TYPE_TRIPLE):
+            embedding = doc.get("embedding")
+            if embedding is None:
+                continue
+            items.append(
+                VectorItem(
+                    id=UUID(str(doc["id"])),
+                    embedding=embedding,
+                    metadata=self._build_triple_metadata(doc),
+                )
+            )
+
+        for doc in await self._query_docs_by_type(_TYPE_CLUSTER):
+            embedding = doc.get("embedding")
+            if embedding is None:
+                continue
+            items.append(
+                VectorItem(
+                    id=UUID(str(doc["id"])),
+                    embedding=embedding,
+                    metadata=self._build_cluster_metadata(doc),
+                )
+            )
+
+        return items
+
+    def _vector_store_ids(self) -> set[str] | None:
+        if hasattr(self._vectors, "_metadata"):
+            metadata = getattr(self._vectors, "_metadata", {})
+            if isinstance(metadata, dict):
+                return set(metadata.keys())
+        if hasattr(self._vectors, "_store"):
+            store = getattr(self._vectors, "_store", {})
+            if isinstance(store, dict):
+                return {str(key) for key in store.keys()}
+        return None
+
+    async def _clear_vector_store(self) -> None:
+        clear = getattr(self._vectors, "clear", None)
+        if callable(clear):
+            result = clear()
+            if hasattr(result, "__await__"):
+                await result
+            return
+        vector_ids = self._vector_store_ids()
+        if vector_ids is None:
+            raise MemoryError("Vector store does not support consistency repair")
+        for vector_id in vector_ids:
+            await self._vectors.delete(UUID(vector_id))
+
+    async def _ensure_vector_doc_consistency(self) -> None:
+        if self._consistency_checked:
+            return
+
+        expected_items = await self._expected_vector_items()
+        expected_ids = {str(item.id) for item in expected_items}
+        current_ids = self._vector_store_ids()
+
+        if current_ids is None:
+            current_count = await self._vectors.count()
+            if current_count == len(expected_items):
+                self._consistency_checked = True
+                return
+            logger.warning(
+                "SemanticMemoryStore: vector/doc count mismatch (%d != %d) but vector IDs are unavailable; leaving store unchanged.",
+                current_count,
+                len(expected_items),
+            )
+            self._consistency_checked = True
+            return
+
+        if current_ids != expected_ids:
+            logger.warning(
+                "SemanticMemoryStore: repairing vector/document desync (vectors=%d docs=%d).",
+                len(current_ids),
+                len(expected_ids),
+            )
+            await self._clear_vector_store()
+            if expected_items:
+                await self._vectors.bulk_insert(expected_items)
+
+        self._consistency_checked = True
 
     async def _ensure_entity_node(self, ref: EntityRef) -> None:
         """Insert an entity node into GraphStore + DocumentStore + VectorStore if absent."""
@@ -329,6 +461,8 @@ class SemanticMemoryStore(SemanticMemoryInterface):
         if not triples:
             return 0
 
+        await self._ensure_vector_doc_consistency()
+
         written = 0
         for triple in triples:
             triple_doc_id = self._triple_doc_id(triple.id)
@@ -364,6 +498,12 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                     },
                 )
 
+                # Persist full triple document before indexing it so startup
+                # repair can deterministically rebuild vectors from documents.
+                doc = triple.model_dump(mode="json")
+                doc["_type"] = _TYPE_TRIPLE
+                await self._docs.put(triple_doc_id, doc)
+
                 # Index the triple embedding when available.
                 if triple.embedding is not None:
                     metadata: dict[str, Any] = {
@@ -378,11 +518,6 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                         embedding=triple.embedding,
                         metadata=metadata,
                     )
-
-                # Persist full triple document.
-                doc = triple.model_dump(mode="json")
-                doc["_type"] = _TYPE_TRIPLE
-                await self._docs.put(triple_doc_id, doc)
 
                 written += 1
                 logger.debug(
@@ -417,6 +552,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
             The best-matching entity or ``None`` if nothing is close enough.
         """
         try:
+            await self._ensure_vector_doc_consistency()
             # Exact name match.
             docs = await self._docs.query(
                 filters={"_type": _TYPE_ENTITY, "canonical_name": name},
@@ -517,6 +653,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
         deleted (e.g. pruned by maintenance).
         """
         try:
+            await self._ensure_vector_doc_consistency()
             results = await self._vectors.search(
                 query_embedding=embedding,
                 top_k=top_k,

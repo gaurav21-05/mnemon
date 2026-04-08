@@ -156,6 +156,11 @@ class InMemoryVectorStore(VectorStore):
         """Return the total number of vectors currently stored."""
         return len(self._store)
 
+    async def clear(self) -> None:
+        """Remove all stored vectors."""
+        self._store.clear()
+        logger.debug("VectorStore.clear")
+
 
 # ---------------------------------------------------------------------------
 # InMemoryDocumentStore

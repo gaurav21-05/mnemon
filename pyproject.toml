@@ -22,6 +22,7 @@ pydantic-settings = "^2.3"
 anyio = "^4.4"
 litellm = "^1.40"
 typing-extensions = "^4.12"
+mcp = {version = "^1.9", optional = true}
 
 # Optional backends
 qdrant-client = {version = "^1.9", optional = true}
@@ -42,11 +43,12 @@ neo4j = ["neo4j"]
 postgres = ["asyncpg"]
 sqlite = ["aiosqlite"]
 scheduler = ["apscheduler"]
+mcp = ["mcp"]
 all = [
     "qdrant-client", "hnswlib",
     "falkordb", "igraph", "neo4j",
     "asyncpg", "aiosqlite",
-    "apscheduler",
+    "apscheduler", "mcp",
 ]
 
 [tool.poetry.group.dev.dependencies]

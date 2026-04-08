@@ -91,6 +91,84 @@ class DaemonClient:
     async def browse(self, task: str) -> dict[str, Any]:
         return await self.call("browse", task=task)
 
+    async def list_dir(self, path: str = ".") -> dict[str, Any]:
+        return await self.call("workspace.list", path=path)
+
+    async def read_file(self, path: str) -> dict[str, Any]:
+        return await self.call("workspace.read", path=path)
+
+    async def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
+        return await self.call("workspace.write", path=path, content=content, append=append)
+
+    async def patch_file(
+        self,
+        path: str,
+        search: str,
+        replace: str,
+        cwd: str | None = None,
+        replace_all: bool = False,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "path": path,
+            "search": search,
+            "replace": replace,
+            "replace_all": replace_all,
+        }
+        if cwd is not None:
+            params["cwd"] = cwd
+        return await self.call("workspace.patch", **params)
+
+    async def exec_command(
+        self,
+        command: str,
+        cwd: str | None = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"command": command, "timeout_s": timeout_s}
+        if cwd is not None:
+            params["cwd"] = cwd
+        return await self.call("workspace.exec", **params)
+
+    async def verify(
+        self,
+        commands: list[str],
+        cwd: str | None = None,
+        timeout_s: float = 120.0,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "commands": commands,
+            "timeout_s": timeout_s,
+        }
+        if cwd is not None:
+            params["cwd"] = cwd
+        return await self.call("workspace.verify", **params)
+
+    async def git_diff(self, cwd: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if cwd is not None:
+            params["cwd"] = cwd
+        return await self.call("workspace.git_diff", **params)
+
+    async def git_status(self, cwd: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if cwd is not None:
+            params["cwd"] = cwd
+        return await self.call("workspace.git_status", **params)
+
+    async def create_worktree(
+        self,
+        branch: str,
+        base_ref: str = "HEAD",
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"branch": branch, "base_ref": base_ref}
+        if path is not None:
+            params["path"] = path
+        return await self.call("workspace.worktree_create", **params)
+
+    async def remove_worktree(self, path: str, force: bool = False) -> dict[str, Any]:
+        return await self.call("workspace.worktree_remove", path=path, force=force)
+
     async def mark_inbox_read(self, message_id: str | None = None) -> dict[str, Any]:
         return await self.call("inbox.mark_read", **({"message_id": message_id} if message_id else {}))
 

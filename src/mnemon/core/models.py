@@ -79,6 +79,7 @@ class ConsolidationState(StrEnum):
 
     RAW = "raw"
     PROCESSING = "processing"
+    FAILED = "failed"
     CONSOLIDATED = "consolidated"
     ARCHIVED = "archived"
 
@@ -352,6 +353,11 @@ class Episode(BaseModel):
     reward_signal: float = Field(default=0.0)
     access_count: int = Field(ge=0, default=0)
     consolidation_state: ConsolidationState = ConsolidationState.RAW
+    consolidation_attempts: int = Field(
+        ge=0,
+        default=0,
+        description="Number of failed consolidation extraction attempts.",
+    )
     decay_lambda: float = Field(
         ge=0.0,
         default=0.001,

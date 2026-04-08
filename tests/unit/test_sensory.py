@@ -102,6 +102,13 @@ async def test_process_entities_empty_by_default() -> None:
     assert percept.entities == []
 
 
+async def test_process_extracts_simple_title_case_entities() -> None:
+    buf = _make_buffer()
+    percept = await buf.process("Rohit is building Mnemon")
+    names = [entity.canonical_name for entity in percept.entities]
+    assert names == ["Rohit", "Mnemon"]
+
+
 async def test_process_sentiment_zero_by_default() -> None:
     buf = _make_buffer()
     percept = await buf.process("test")

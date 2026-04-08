@@ -399,8 +399,21 @@ class Orchestrator(OrchestratorInterface):
                 update={
                     "reward_signal": reward_signal.rpe,
                     "emotional_valence": max(-1.0, min(1.0, reward_signal.rpe)),
+                    "entities": percept.entities if percept is not None else [],
+                    "tags": [
+                        entity.canonical_name.lower()
+                        for entity in (percept.entities if percept is not None else [])
+                    ],
                 }
             )
+
+            # Meta-cognitive self-evaluation
+            meta_eval = await self._meta.evaluate_cycle(episode_with_reward, reward_signal.rpe)
+
+            if meta_eval.lessons:
+                episode_with_reward = episode_with_reward.model_copy(
+                    update={"reflection": " ".join(meta_eval.lessons)}
+                )
 
             # Encode episode to episodic memory
             await self._episodic.encode(episode_with_reward)
@@ -411,9 +424,6 @@ class Orchestrator(OrchestratorInterface):
                 entities = [e.canonical_name for e in percept.entities]
                 if entities:
                     await self._valence.update(entities, reward_signal.rpe)
-
-            # Meta-cognitive self-evaluation
-            meta_eval = await self._meta.evaluate_cycle(episode_with_reward, reward_signal.rpe)
 
             phases_completed.append("learning")
             logger.debug(

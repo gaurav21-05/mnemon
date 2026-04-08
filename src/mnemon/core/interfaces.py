@@ -457,6 +457,38 @@ class LLMProvider(ABC):
             The generated text, stripped of any wrapping metadata.
         """
 
+    async def generate_chat(
+        self,
+        system: str,
+        history: list[dict[str, str]],
+        message: str,
+        **kwargs: Any,
+    ) -> str:
+        """Generate a reply given a system prompt, conversation history, and new message.
+
+        Default implementation concatenates everything into a single prompt
+        and calls ``generate``.  Subclasses may override to use native
+        multi-turn message APIs.
+
+        Parameters
+        ----------
+        system:
+            System / persona prompt.
+        history:
+            List of ``{"role": "user"|"assistant", "content": str}`` dicts,
+            oldest first.
+        message:
+            The latest user message.
+        """
+        parts = [system]
+        for turn in history:
+            role = turn.get("role", "user")
+            content = turn.get("content", "")
+            parts.append(f"{role.capitalize()}: {content}")
+        parts.append(f"User: {message}")
+        parts.append("Assistant:")
+        return await self.generate("\n\n".join(parts), **kwargs)
+
     @abstractmethod
     async def generate_structured(
         self,

@@ -168,3 +168,17 @@ async def test_last_episode_id_updated_after_each_cycle() -> None:
     assert id1 is not None
     assert id2 is not None
     assert id1 != id2
+
+
+async def test_run_cycle_persists_entities_and_tags() -> None:
+    config = MnemonConfig()
+    orch = _make_orchestrator(config)
+
+    await orch.run_cycle(raw_input="Rohit uses Mnemon")
+    assert orch._last_episode_id is not None
+
+    ep = await orch._episodic.get(orch._last_episode_id)
+    assert ep is not None
+    names = [entity.canonical_name for entity in ep.entities]
+    assert names == ["Rohit", "Mnemon"]
+    assert ep.tags == ["rohit", "mnemon"]
