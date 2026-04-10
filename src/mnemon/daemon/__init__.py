@@ -26,10 +26,9 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import Any
-
 import os
 import subprocess
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
@@ -39,11 +38,13 @@ from mnemon.daemon.config import DaemonConfig
 from mnemon.daemon.goals.persistent_store import PersistentGoalStore
 from mnemon.daemon.ipc import DaemonIPCServer
 from mnemon.daemon.loop import IdleThinkingLoop
-from mnemon.daemon.observers import ObserverPlugin, ObserverRegistry
 from mnemon.daemon.observers.cron import CronObserver
 from mnemon.daemon.observers.filesystem import FileSystemObserver
 from mnemon.daemon.observers.web import WebLearningObserver, WebSource
 from mnemon.daemon.state import DaemonState, load_state, save_state
+
+if TYPE_CHECKING:
+    from mnemon.daemon.observers import ObserverPlugin
 
 logger = logging.getLogger(__name__)
 
@@ -308,11 +309,20 @@ class JarvisDaemon:
                 cwd=state_dir,
                 capture_output=True,
                 check=True,
-                env={**__import__("os").environ, "GIT_AUTHOR_NAME": "Jarvis", "GIT_AUTHOR_EMAIL": "jarvis@local", "GIT_COMMITTER_NAME": "Jarvis", "GIT_COMMITTER_EMAIL": "jarvis@local"},
+                env={
+                    **__import__("os").environ,
+                    "GIT_AUTHOR_NAME": "Jarvis",
+                    "GIT_AUTHOR_EMAIL": "jarvis@local",
+                    "GIT_COMMITTER_NAME": "Jarvis",
+                    "GIT_COMMITTER_EMAIL": "jarvis@local",
+                },
             )
             logger.info("Git journal committed: %s", msg[:80])
         except subprocess.CalledProcessError as exc:
-            logger.warning("git commit failed: %s", exc.stderr.decode()[:200] if exc.stderr else str(exc))
+            logger.warning(
+                "git commit failed: %s",
+                exc.stderr.decode()[:200] if exc.stderr else str(exc),
+            )
 
 
 class DaemonFactory:
@@ -395,10 +405,21 @@ class DaemonFactory:
             sources: list[WebSource] = []
             if obs_config.web_learning_use_defaults:
                 from mnemon.daemon.observers.web import _default_sources
+
                 sources.extend(_default_sources())
             for s in obs_config.web_learning_sources:
-                sources.append(WebSource(url=s.url, name=s.name, kind=s.kind, interval_s=s.interval_s))
-            observers.append(WebLearningObserver(sources=sources))
+                sources.append(
+                    WebSource(
+                        url=s.url,
+                        name=s.name,
+                        kind=s.kind,
+                        interval_s=s.interval_s,
+                    )
+                )
+            if sources:
+                observers.append(WebLearningObserver(sources=sources))
+            else:
+                logger.info("Web learning enabled but no sources configured — observer skipped.")
 
         # 7. IPC server
         ipc_server = DaemonIPCServer(
@@ -439,7 +460,6 @@ class DaemonFactory:
         fall back to the in-memory implementations. Similarly, if no API key
         is set for the default LLM provider, try to use local Ollama.
         """
-        import importlib
         import os
         import shutil
 
@@ -475,6 +495,7 @@ class DaemonFactory:
                 "embedding_dimensions": 768,
                 "api_base": "http://localhost:11434",
             }
+            config.consolidation.batch_size = min(config.consolidation.batch_size, 1)
             logger.info(
                 "No API key found — using local Ollama (model=%s, embedding=nomic-embed-text).",
                 chosen_model,

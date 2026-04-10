@@ -22,28 +22,28 @@ except PackageNotFoundError:
 # Core models and config are lightweight — safe to import eagerly.
 # Everything else (vector backends, graph backends, LiteLLM) is deferred.
 from mnemon.core import (
-    # Config
-    MnemonConfig,
-    load_config,
     # Exceptions — always useful at the top level
     BackendNotAvailableError,
-    ConfigError,
-    ConsolidationError,
-    GoalError,
-    MemoryError,
-    MnemonError,
-    RetrievalError,
-    SkillExecutionError,
-    TokenBudgetExceededError,
     # Key model types callers need without digging into subpackages
     CognitiveMessage,
+    ConfigError,
+    ConsolidationError,
     ContextBlock,
-    Episode,
     Entity,
+    Episode,
     Goal,
+    GoalError,
+    MemoryError,
+    # Config
+    MnemonConfig,
+    MnemonError,
     PerceptUnit,
+    RetrievalError,
     Skill,
+    SkillExecutionError,
+    TokenBudgetExceededError,
     WorkingMemoryState,
+    load_config,
 )
 
 

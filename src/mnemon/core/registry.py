@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from mnemon.core.config import MnemonConfig
 from mnemon.core.exceptions import BackendNotAvailableError, ConfigError
+
+if TYPE_CHECKING:
+    from mnemon.core.config import MnemonConfig
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +123,7 @@ class ModuleRegistry:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_config(cls, config: MnemonConfig) -> "ModuleRegistry":
+    def from_config(cls, config: MnemonConfig) -> ModuleRegistry:
         """Build a registry from *config*, auto-detecting available backends.
 
         Detection strategy (in priority order for each resource type):
@@ -180,14 +182,22 @@ class ModuleRegistry:
         provider_cfg: dict[str, Any] = dict(config.llm.providers.get(provider_name, {}))
 
         # Extract well-known keys; forward everything else as **kwargs
-        _KNOWN_KEYS = {"model", "embedding_model", "embedding_dimensions", "temperature", "max_tokens"}
+        known_keys = {
+            "model",
+            "embedding_model",
+            "embedding_dimensions",
+            "temperature",
+            "max_tokens",
+        }
         model: str = provider_cfg.get("model", "gpt-4o-mini")
         embedding_model: str = provider_cfg.get("embedding_model", "text-embedding-3-small")
         embedding_dimensions: int = provider_cfg.get("embedding_dimensions", 1536)
         temperature: float = provider_cfg.get("temperature", 0.0)
         max_tokens: int = provider_cfg.get("max_tokens", 2048)
         # Remaining keys are provider-specific (api_key, api_base, etc.)
-        extra_kwargs: dict[str, Any] = {k: v for k, v in provider_cfg.items() if k not in _KNOWN_KEYS}
+        extra_kwargs: dict[str, Any] = {
+            k: v for k, v in provider_cfg.items() if k not in known_keys
+        }
 
         llm_impl = LiteLLMProvider(
             model=model,
@@ -264,7 +274,8 @@ class ModuleRegistry:
         """Register DocumentStore implementation based on available extras."""
         from mnemon.core.interfaces import DocumentStore
 
-        backend = getattr(config.episodic, "backend", None) or "auto"  # doc store shares episodic backend
+        # The document store shares the episodic backend selection.
+        backend = getattr(config.episodic, "backend", None) or "auto"
 
         if backend in ("postgres", "auto") and _is_importable("asyncpg"):
             impl = _lazy_init(

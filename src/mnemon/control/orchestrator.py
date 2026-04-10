@@ -21,11 +21,9 @@ The Orchestrator implements a 6-phase cognitive cycle:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from mnemon.core.bus import CognitiveBus
-from mnemon.core.config import MnemonConfig
 from mnemon.core.interfaces import (
     AttentionControllerInterface,
     EmbeddingProvider,
@@ -49,6 +47,10 @@ from mnemon.core.models import (
     RetrievalQuery,
     RetrievedItem,
 )
+
+if TYPE_CHECKING:
+    from mnemon.core.bus import CognitiveBus
+    from mnemon.core.config import MnemonConfig
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,9 @@ class Orchestrator(OrchestratorInterface):
         self._bus = bus
         self._cycle_count: int = 0
         self._last_episode_id: UUID | None = None
+        self._suppress_next_episode_storage = False
+        self._next_episode_redactions: list[str] = []
+        self._last_episode_redactions: list[str] = []
 
     # ------------------------------------------------------------------
     # OrchestratorInterface implementation
@@ -340,6 +345,11 @@ class Orchestrator(OrchestratorInterface):
                 "context": "\n".join(context_parts),
                 "goal": goal_text,
                 "retrieved_count": len(retrieved_items),
+                "citation_ids": [
+                    str(item.metadata.get("episode_id") or item.metadata.get("triple_id") or "")
+                    for item in retrieved_items
+                    if item.metadata.get("episode_id") or item.metadata.get("triple_id")
+                ],
             }
 
             phases_completed.append("deliberation")
@@ -415,15 +425,30 @@ class Orchestrator(OrchestratorInterface):
                     update={"reflection": " ".join(meta_eval.lessons)}
                 )
 
-            # Encode episode to episodic memory
-            await self._episodic.encode(episode_with_reward)
-            self._last_episode_id = episode_with_reward.id
+            if self._suppress_next_episode_storage:
+                logger.debug(
+                    "Cycle %d / phase 6 LEARNING: suppressed episode storage for privacy.",
+                    self._cycle_count,
+                )
+                self._last_episode_id = None
+                self._suppress_next_episode_storage = False
+                self._next_episode_redactions = []
+                self._last_episode_redactions = []
+            else:
+                redactions = list(self._next_episode_redactions)
+                if redactions:
+                    episode_with_reward = self._redact_episode(episode_with_reward, redactions)
+                self._next_episode_redactions = []
+                self._last_episode_redactions = redactions
+                # Encode episode to episodic memory
+                await self._episodic.encode(episode_with_reward)
+                self._last_episode_id = episode_with_reward.id
 
-            # Update valence associations
-            if percept is not None:
-                entities = [e.canonical_name for e in percept.entities]
-                if entities:
-                    await self._valence.update(entities, reward_signal.rpe)
+                # Update valence associations
+                if percept is not None:
+                    entities = [e.canonical_name for e in percept.entities]
+                    if entities:
+                        await self._valence.update(entities, reward_signal.rpe)
 
             phases_completed.append("learning")
             logger.debug(
@@ -473,11 +498,89 @@ class Orchestrator(OrchestratorInterface):
         episode = await self._episodic.get(self._last_episode_id)
         if episode is None:
             return
+        outcome = self._redact_text(outcome, self._last_episode_redactions)
         await self._episodic.update(episode.id, outcome=outcome)
         logger.debug(
             "Updated outcome for episode %s (len=%d)",
             self._last_episode_id,
             len(outcome),
+        )
+
+    async def update_last_episode_metadata(self, **updates: Any) -> None:
+        """Patch tags / importance / reflection on the latest stored episode."""
+        if self._last_episode_id is None:
+            return
+        episode = await self._episodic.get(self._last_episode_id)
+        if episode is None:
+            return
+
+        merged_updates = dict(updates)
+        if "tags" in merged_updates:
+            incoming_tags = [str(tag) for tag in merged_updates["tags"]]
+            merged_updates["tags"] = list(dict.fromkeys([*episode.tags, *incoming_tags]))
+        if "importance" in merged_updates:
+            merged_updates["importance"] = max(0.0, min(1.0, float(merged_updates["importance"])))
+
+        await self._episodic.update(episode.id, **merged_updates)
+        logger.debug(
+            "Updated metadata for episode %s fields=%s",
+            self._last_episode_id,
+            sorted(merged_updates.keys()),
+        )
+
+    async def record_retrieval_feedback(
+        self,
+        memory_ids: list[str],
+        helpful: bool = True,
+    ) -> None:
+        """Record that retrieved memories were actually used in the cycle."""
+        for raw_id in memory_ids:
+            try:
+                episode_id = UUID(str(raw_id))
+            except ValueError:
+                continue
+            episode = await self._episodic.get(episode_id)
+            if episode is None:
+                continue
+            updates: dict[str, Any] = {
+                "retrieval_uses": episode.retrieval_uses + 1,
+                "retrieval_last_used_at": __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc
+                ),
+                "base_strength": min(episode.base_strength + 0.08, 3.0),
+            }
+            if helpful:
+                updates["retrieval_help_count"] = episode.retrieval_help_count + 1
+                updates["importance"] = min(1.0, episode.importance + 0.02)
+                updates["decay_lambda"] = max(0.0001, episode.decay_lambda * 0.97)
+            await self._episodic.update(episode_id, **updates)
+
+    def suppress_next_episode_storage(self) -> None:
+        """Skip persistence for the next cycle's flushed episode."""
+        self._suppress_next_episode_storage = True
+
+    def configure_next_episode_redactions(self, redactions: list[str]) -> None:
+        """Apply literal phrase redactions to the next stored episode."""
+        self._next_episode_redactions = [item for item in redactions if item.strip()]
+
+    @staticmethod
+    def _redact_text(text: str | None, redactions: list[str]) -> str | None:
+        if text is None:
+            return None
+        redacted = text
+        for phrase in redactions:
+            redacted = redacted.replace(phrase, "[REDACTED]")
+        return redacted
+
+    def _redact_episode(self, episode: Any, redactions: list[str]) -> Any:
+        """Redact literal phrases from the episode before persistence."""
+        return episode.model_copy(
+            update={
+                "context": self._redact_text(episode.context, redactions),
+                "action": self._redact_text(episode.action, redactions),
+                "outcome": self._redact_text(episode.outcome, redactions),
+                "reflection": self._redact_text(episode.reflection, redactions),
+            }
         )
 
     async def run_until_complete(
@@ -526,11 +629,7 @@ class Orchestrator(OrchestratorInterface):
             matching = [g for g in active_goals if g.id == goal.id]
 
             # If the goal is no longer in the active list it was completed or failed
-            if matching:
-                current_status = matching[0].status
-            else:
-                # Goal removed from active list — check original object for mutation
-                current_status = goal.status
+            current_status = matching[0].status if matching else goal.status
 
             logger.debug(
                 "run_until_complete: cycle=%d goal_status=%s",
@@ -636,8 +735,6 @@ class Orchestrator(OrchestratorInterface):
             ],
             "bus": {
                 "running": self._bus.is_running() if self._bus is not None else False,
-                "subscriptions": (
-                    self._bus.subscription_count() if self._bus is not None else 0
-                ),
+                "subscriptions": (self._bus.subscription_count() if self._bus is not None else 0),
             },
         }

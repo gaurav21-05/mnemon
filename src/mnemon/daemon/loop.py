@@ -29,20 +29,39 @@ Each tick: select activity by weight → execute → update identity files
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import random
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
-from mnemon.daemon.config import IdleLoopConfig
+from mnemon.core.models import (
+    ConsolidationState,
+    Episode,
+    Goal,
+    GoalStatus,
+    MemoryLifecycleState,
+    SemanticTriple,
+)
 from mnemon.daemon.identity import JarvisIdentity
 from mnemon.daemon.state import DaemonState, ProactiveMessage, ThoughtEntry
 
+if TYPE_CHECKING:
+    from mnemon.daemon.config import IdleLoopConfig
+
 logger = logging.getLogger(__name__)
+
+_EXTERNAL_SOURCE_TERMS = (
+    "calendar",
+    "email",
+    "inbox",
+    "digital footprint",
+    "browser history",
+)
 
 
 class IdleThinkingLoop:
@@ -54,7 +73,7 @@ class IdleThinkingLoop:
 
     def __init__(
         self,
-        brain: Any,          # Mnemon instance — typed as Any to avoid circular import
+        brain: Any,  # Mnemon instance — typed as Any to avoid circular import
         config: IdleLoopConfig,
         state: DaemonState,
         state_dir: Path | None = None,
@@ -65,7 +84,7 @@ class IdleThinkingLoop:
         self._identity = JarvisIdentity(state_dir) if state_dir else None
         self._running = False
         self._paused = False
-        self._busy = False   # True while an LLM tick is in progress
+        self._busy = False  # True while an LLM tick is in progress
         self._cycles_this_hour: int = 0
         self._hour_start: float = time.monotonic()
         # Track recently used episode IDs per activity to avoid repetition
@@ -74,6 +93,7 @@ class IdleThinkingLoop:
         # Rate limit proactive pushes — max 1 per 10 minutes
         self._last_proactive_push: float = 0.0
         self._min_push_interval_s: float = 600.0
+        self._autonomous_browser_queries: set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -176,14 +196,14 @@ class IdleThinkingLoop:
     async def _tick(self) -> dict[str, Any]:
         """Execute one idle cycle, chosen by weighted random selection."""
         activities = [
-            ("help_master",   self._config.help_master_weight,   self._help_master),
-            ("know_master",   self._config.know_master_weight,   self._know_master),
-            ("grow",          self._config.grow_weight,          self._grow),
+            ("help_master", self._config.help_master_weight, self._help_master),
+            ("know_master", self._config.know_master_weight, self._know_master),
+            ("grow", self._config.grow_weight, self._grow),
             ("consolidation", self._config.consolidation_weight, self._consolidate),
-            ("exploration",   self._config.exploration_weight,   self._explore),
+            ("exploration", self._config.exploration_weight, self._explore),
         ]
 
-        names, weights, funcs = zip(*activities)
+        names, weights, funcs = zip(*activities, strict=False)
         total = sum(weights)
         if total <= 0:
             return {"activity": "skip", "summary": "all weights are zero"}
@@ -202,10 +222,7 @@ class IdleThinkingLoop:
         if not summary or len(summary) < 20:
             return False
         fingerprint = summary[:80].lower().strip()
-        recent_same_type = [
-            t for t in self._state.recent_thoughts[-20:]
-            if t.activity == activity
-        ]
+        recent_same_type = [t for t in self._state.recent_thoughts[-20:] if t.activity == activity]
         for thought in recent_same_type[-5:]:
             if thought.summary[:80].lower().strip() == fingerprint:
                 return True
@@ -219,6 +236,507 @@ class IdleThinkingLoop:
             return action.strip()
         context = getattr(ep, "context", "") or ""
         return context.strip()
+
+    @staticmethod
+    def _delegates_learning_to_master(text: str) -> bool:
+        lowered = text.lower()
+        learning_verbs = (
+            "should learn",
+            "should research",
+            "should explore",
+            "could learn",
+            "could research",
+            "could look into",
+            "they need to",
+            "they should",
+            "your master should",
+            "schedule a meeting",
+        )
+        return any(phrase in lowered for phrase in learning_verbs)
+
+    @classmethod
+    def _reframe_master_homework(cls, text: str) -> str:
+        """Convert homework-like thoughts into Jarvis-owned learning actions."""
+        if not cls._delegates_learning_to_master(text):
+            return text
+        return (
+            "I will investigate this myself, store a concise learning note, and only surface "
+            "a recommendation once I have a concrete artifact or memory-backed finding."
+        )
+
+    @staticmethod
+    def _mentions_external_sources(text: str) -> bool:
+        lowered = text.lower()
+        return any(term in lowered for term in _EXTERNAL_SOURCE_TERMS)
+
+    @staticmethod
+    def _external_sources_grounded(text: str, context: str) -> bool:
+        lowered_text = text.lower()
+        lowered_context = context.lower()
+        return any(
+            term in lowered_text and term in lowered_context
+            for term in _EXTERNAL_SOURCE_TERMS
+        )
+
+    @classmethod
+    def _replace_ungrounded_external_claims(
+        cls,
+        text: str,
+        context: str,
+        fallback: str,
+    ) -> str:
+        """Prevent idle thoughts from inventing source access not present in memory."""
+        if cls._mentions_external_sources(text) and not cls._external_sources_grounded(
+            text,
+            context,
+        ):
+            return fallback
+        return text
+
+    @staticmethod
+    def _fact_text(triple: SemanticTriple) -> str:
+        object_text = triple.object.name if hasattr(triple.object, "name") else str(triple.object)
+        return f"{triple.subject.name} {triple.predicate} {object_text}"
+
+    def _workspace_context(self, limit: int = 24) -> str:
+        """Summarize nearby workspace files so idle thinking has real file context."""
+        root = Path.cwd()
+        ignored = {
+            ".git",
+            ".venv",
+            "node_modules",
+            "dist",
+            "build",
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+        }
+        entries: list[str] = []
+        try:
+            for child in sorted(root.iterdir(), key=lambda item: (not item.is_dir(), item.name)):
+                if child.name in ignored or child.name.startswith("."):
+                    continue
+                kind = "dir" if child.is_dir() else "file"
+                entries.append(f"- {kind}: {child.name}")
+                if len(entries) >= limit:
+                    break
+        except OSError:
+            return ""
+        if not entries:
+            return ""
+        return f"Workspace root: {root}\nVisible files:\n" + "\n".join(entries)
+
+    @staticmethod
+    def _needs_web_research(text: str) -> bool:
+        lowered = text.lower()
+        triggers = (
+            "online",
+            "web",
+            "internet",
+            "latest",
+            "current",
+            "research",
+            "look up",
+            "find out",
+            "polymarket",
+            "market",
+        )
+        return any(trigger in lowered for trigger in triggers)
+
+    async def _maybe_autonomous_web_research(self, goal_text: str) -> dict[str, Any] | None:
+        """Run one bounded, goal-driven browser task instead of ingesting random feeds."""
+        query = " ".join(goal_text.split())[:180]
+        if not query or not self._needs_web_research(query):
+            return None
+        key = query.lower()
+        if key in self._autonomous_browser_queries:
+            return None
+        self._autonomous_browser_queries.add(key)
+
+        try:
+            from mnemon.daemon.tools.browser import JarvisBrowser
+
+            browser = JarvisBrowser(self._brain)
+            result = await browser.browse(
+                (
+                    "Research this goal for Jarvis memory. Return concrete, source-grounded "
+                    f"findings and avoid generic advice: {query}"
+                ),
+                store_in_memory=True,
+            )
+        except Exception as exc:
+            return {"summary": f"Goal-driven web research failed: {exc}", "mode": "web_research"}
+
+        return {
+            "summary": f"Researched goal context: {query}",
+            "mode": "web_research",
+            "full_thought": result[:1000],
+        }
+
+    def _goal_lookup(self) -> dict[str, Goal]:
+        goal_manager = getattr(self._brain.control, "goals", None)
+        raw_goals = getattr(goal_manager, "_goals", {})
+        if not isinstance(raw_goals, dict):
+            return {}
+        goals: dict[str, Goal] = {}
+        for goal_id, goal in raw_goals.items():
+            if isinstance(goal, Goal):
+                goals[str(goal_id)] = goal
+        return goals
+
+    @staticmethod
+    def _goal_status_weight(goal: Goal | None) -> tuple[float, float]:
+        if goal is None:
+            return (0.6, 0.0)
+        match goal.status:
+            case GoalStatus.ACTIVE:
+                return (1.0, goal.priority)
+            case GoalStatus.COMPLETED:
+                return (0.85, goal.priority)
+            case GoalStatus.SUSPENDED:
+                return (0.35, goal.priority)
+            case GoalStatus.BLOCKED:
+                return (0.25, goal.priority)
+            case GoalStatus.FAILED:
+                return (0.15, goal.priority)
+            case GoalStatus.DROPPED:
+                return (0.1, goal.priority)
+        return (0.6, goal.priority)
+
+    def _prioritize_goal_linked_episodes(self, episodes: list[Episode]) -> list[Episode]:
+        goals = self._goal_lookup()
+
+        def _priority(episode: Episode) -> tuple[float, float, float, datetime]:
+            goal = goals.get(str(episode.goal_id)) if episode.goal_id else None
+            status_weight, goal_priority = self._goal_status_weight(goal)
+            return (status_weight, goal_priority, episode.importance, episode.timestamp)
+
+        return sorted(episodes, key=_priority, reverse=True)
+
+    async def _apply_goal_anchored_lifecycle(self) -> dict[str, int]:
+        goals = self._goal_lookup()
+        episodic = getattr(self._brain.memory, "episodic", None)
+        if not goals or episodic is None or not hasattr(episodic, "_document_store"):
+            return {"promoted_to_summary": 0, "accelerated_decay": 0}
+        if not hasattr(episodic, "update"):
+            return {"promoted_to_summary": 0, "accelerated_decay": 0}
+
+        raw_docs = await episodic._document_store.query(filters={}, limit=10_000)
+        promoted_to_summary = 0
+        accelerated_decay = 0
+
+        for raw_doc in raw_docs:
+            try:
+                episode = Episode.model_validate(raw_doc)
+            except Exception:
+                continue
+
+            if episode.goal_id is None:
+                continue
+
+            goal = goals.get(str(episode.goal_id))
+            if goal is None:
+                continue
+
+            if (
+                goal.status == GoalStatus.COMPLETED
+                and episode.lifecycle_state
+                in {
+                    MemoryLifecycleState.DURABLE,
+                    MemoryLifecycleState.CONSOLIDATED,
+                }
+                and episode.consolidation_state
+                in {
+                    ConsolidationState.CONSOLIDATED,
+                    ConsolidationState.ARCHIVED,
+                }
+            ):
+                await episodic.update(
+                    episode.id,
+                    lifecycle_state=MemoryLifecycleState.SUMMARY,
+                )
+                promoted_to_summary += 1
+                continue
+
+            if goal.status not in {
+                GoalStatus.SUSPENDED,
+                GoalStatus.FAILED,
+                GoalStatus.BLOCKED,
+                GoalStatus.DROPPED,
+            }:
+                continue
+
+            if episode.lifecycle_state in {
+                MemoryLifecycleState.SUMMARY,
+                MemoryLifecycleState.HISTORICAL,
+                MemoryLifecycleState.ARCHIVED,
+                MemoryLifecycleState.FORGOTTEN,
+                MemoryLifecycleState.EXCLUDED,
+            }:
+                continue
+
+            new_decay_lambda = min(max(episode.decay_lambda, 0.001) * 2.0, 1.0)
+            if new_decay_lambda <= episode.decay_lambda:
+                continue
+
+            await episodic.update(episode.id, decay_lambda=new_decay_lambda)
+            accelerated_decay += 1
+
+        return {
+            "promoted_to_summary": promoted_to_summary,
+            "accelerated_decay": accelerated_decay,
+        }
+
+    async def _find_contradiction_insight(self) -> dict[str, Any] | None:
+        semantic = getattr(self._brain.memory, "semantic", None)
+        docs_store = getattr(semantic, "_docs", None)
+        if docs_store is None:
+            return None
+
+        triple_docs = await docs_store.query(filters={"_type": "triple"}, limit=10_000)
+        groups: dict[str, list[SemanticTriple]] = {}
+        for doc in triple_docs:
+            contradiction_group = str(doc.get("contradiction_group", "")).strip()
+            if not contradiction_group:
+                continue
+            try:
+                triple = SemanticTriple.model_validate(doc)
+            except Exception:
+                continue
+            groups.setdefault(contradiction_group, []).append(triple)
+
+        for triples in groups.values():
+            if len(triples) < 2:
+                continue
+            triples.sort(
+                key=lambda triple: (int(triple.current), triple.last_confirmed, triple.confidence),
+                reverse=True,
+            )
+            current = next((triple for triple in triples if triple.current), triples[0])
+            historical = next((triple for triple in triples if not triple.current), None)
+            if historical is None:
+                continue
+            return {
+                "summary": (
+                    f"Contradiction surfaced: {self._fact_text(current)} is current, "
+                    f"but {self._fact_text(historical)} still exists in memory history."
+                ),
+                "insight_type": "contradiction",
+                "priority": 0.95,
+                "share_with_user": True,
+                "proactive_message": (
+                    f"I found a contradiction worth surfacing: {self._fact_text(current)} is the "
+                    f"current fact, but I also remember {self._fact_text(historical)} from an "
+                    "older episode."
+                ),
+                "related_triple_ids": [str(triple.id) for triple in triples],
+            }
+        return None
+
+    def _find_stalled_goal_insight(self) -> dict[str, Any] | None:
+        goal_manager = getattr(self._brain.control, "goals", None)
+        get_active_goals = getattr(goal_manager, "get_active_goals", None)
+        if not callable(get_active_goals):
+            return None
+
+        now = datetime.now(UTC)
+        active_goals = get_active_goals()
+        stalled = [
+            goal
+            for goal in active_goals
+            if goal.progress <= 0.25
+            and (goal.attempts >= 1 or (goal.deadline and goal.deadline < now))
+        ]
+        if not stalled:
+            return None
+
+        stalled.sort(
+            key=lambda goal: (goal.priority, 1.0 - goal.progress),
+            reverse=True,
+        )
+        goal = stalled[0]
+        return {
+            "summary": (
+                f"Stalled goal detected: '{goal.description}' is still low-progress and may need a "
+                "new next step."
+            ),
+            "insight_type": "stalled_goal",
+            "priority": 0.85,
+            "share_with_user": True,
+            "proactive_message": (
+                f"Your goal '{goal.description}' looks stalled. I’d either decompose it into a "
+                "smaller next action or revisit what’s blocking it."
+            ),
+            "goal_id": str(goal.id),
+        }
+
+    async def _find_repeated_pattern_insight(self) -> dict[str, Any] | None:
+        episodic = getattr(self._brain.memory, "episodic", None)
+        docs_store = getattr(episodic, "_document_store", None)
+        if docs_store is None:
+            return None
+
+        raw_docs = await docs_store.query(filters={}, limit=500)
+        ignored_tags = {"auto_capture", "profile_dynamic", "profile_static", "project_context"}
+        grouped: dict[tuple[str, str], list[Episode]] = {}
+        for doc in raw_docs:
+            try:
+                episode = Episode.model_validate(doc)
+            except Exception:
+                continue
+
+            for tag in episode.tags:
+                if not tag or tag in ignored_tags or tag.startswith("source:"):
+                    continue
+                grouped.setdefault((episode.scope_id, tag), []).append(episode)
+
+        repeated: list[tuple[tuple[str, str], list[Episode]]] = [
+            (key, episodes) for key, episodes in grouped.items() if len(episodes) >= 3
+        ]
+        if not repeated:
+            return None
+
+        repeated.sort(key=lambda item: len(item[1]), reverse=True)
+        (scope_id, tag), episodes = repeated[0]
+        candidate_skill: dict[str, Any] | None = None
+        skill_acquirer = getattr(getattr(self._brain, "learning", None), "skill_acquirer", None)
+        if skill_acquirer is not None and hasattr(skill_acquirer, "detect_skill_need"):
+            try:
+                needs = await skill_acquirer.detect_skill_need(episodes[:8])
+            except Exception:
+                needs = []
+            if needs:
+                need = needs[0]
+                candidate_skill = {
+                    "description": need.description,
+                    "trigger_pattern": need.trigger_pattern,
+                    "evidence_count": need.evidence_count,
+                }
+                if hasattr(skill_acquirer, "acquire_skill"):
+                    try:
+                        skill = await skill_acquirer.acquire_skill(need)
+                    except Exception:
+                        skill = None
+                    if skill is not None:
+                        candidate_skill["acquired_skill_id"] = str(skill.id)
+                        candidate_skill["acquired_skill_name"] = skill.name
+        if candidate_skill is None:
+            candidate_skill = {
+                "description": f"Turn recurring '{tag}' work into a reusable skill",
+                "trigger_pattern": f"when work in {scope_id} repeatedly involves {tag}",
+                "evidence_count": len(episodes),
+            }
+        return {
+            "summary": (
+                f"Repeated pattern detected: {len(episodes)} memories in scope '{scope_id}' share "
+                f"the tag '{tag}'."
+            ),
+            "insight_type": "repeated_pattern",
+            "priority": 0.75,
+            "share_with_user": True,
+            "proactive_message": (
+                f"I keep seeing the pattern '{tag}' come up in {scope_id}. That looks like a good "
+                f"candidate for a new skill: {candidate_skill['description']}."
+            ),
+            "episode_ids": [str(episode.id) for episode in episodes[:5]],
+            "candidate_skill": candidate_skill,
+        }
+
+    async def _find_cross_session_connection(self) -> dict[str, Any] | None:
+        episodic = getattr(self._brain.memory, "episodic", None)
+        docs_store = getattr(episodic, "_document_store", None)
+        if docs_store is None:
+            return None
+
+        raw_docs = await docs_store.query(filters={}, limit=500)
+        ignored_tags = {"auto_capture", "profile_dynamic", "profile_static", "summary"}
+        tag_groups: dict[str, dict[str, list[Episode]]] = {}
+        for doc in raw_docs:
+            try:
+                episode = Episode.model_validate(doc)
+            except Exception:
+                continue
+            scope_label = episode.repo_name or episode.scope_id or "personal"
+            for tag in episode.tags:
+                if not tag or tag in ignored_tags or tag.startswith("source:"):
+                    continue
+                tag_groups.setdefault(tag, {}).setdefault(scope_label, []).append(episode)
+
+        candidates = [
+            (tag, scoped_episodes)
+            for tag, scoped_episodes in tag_groups.items()
+            if len(scoped_episodes) >= 2
+        ]
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: sum(len(episodes) for episodes in item[1].values()), reverse=True
+        )
+        tag, scoped_episodes = candidates[0]
+        scope_labels = sorted(scoped_episodes.keys())
+        return {
+            "summary": (
+                f"Cross-session connection: the pattern '{tag}' appears in multiple scopes "
+                f"({', '.join(scope_labels[:3])})."
+            ),
+            "insight_type": "cross_session_connection",
+            "priority": 0.8,
+            "share_with_user": True,
+            "proactive_message": (
+                f"You've dealt with '{tag}' in multiple projects before, including "
+                f"{scope_labels[0]} and {scope_labels[1]}. There may be a reusable approach here."
+            ),
+            "related_scope_ids": scope_labels,
+        }
+
+    async def _mine_causal_chains(self) -> dict[str, int]:
+        episodic = getattr(self._brain.memory, "episodic", None)
+        docs_store = getattr(episodic, "_document_store", None)
+        if episodic is None or docs_store is None or not hasattr(episodic, "update"):
+            return {"linked": 0}
+
+        raw_docs = await docs_store.query(filters={}, limit=1_000)
+        episodes: list[Episode] = []
+        for doc in raw_docs:
+            try:
+                episodes.append(Episode.model_validate(doc))
+            except Exception:
+                continue
+
+        groups: dict[str, list[Episode]] = {}
+        for episode in episodes:
+            group_key = f"{episode.session_id}:{episode.scope_type}:{episode.scope_id}"
+            groups.setdefault(group_key, []).append(episode)
+
+        linked = 0
+        for grouped_episodes in groups.values():
+            ordered = sorted(grouped_episodes, key=lambda episode: episode.timestamp)
+            for previous, current in zip(ordered, ordered[1:], strict=False):
+                if current.caused_by is None:
+                    await episodic.update(current.id, caused_by=previous.id)
+                    linked += 1
+                if current.id not in previous.led_to:
+                    await episodic.update(previous.id, led_to=[*previous.led_to, current.id])
+                    linked += 1
+                    previous = previous.model_copy(
+                        update={"led_to": [*previous.led_to, current.id]}
+                    )
+        return {"linked": linked}
+
+    async def _detect_proactive_insight(self) -> dict[str, Any] | None:
+        candidates = [
+            await self._find_contradiction_insight(),
+            self._find_stalled_goal_insight(),
+            await self._find_cross_session_connection(),
+            await self._find_repeated_pattern_insight(),
+        ]
+        ranked = [candidate for candidate in candidates if candidate is not None]
+        if not ranked:
+            return None
+        ranked.sort(key=lambda item: float(item.get("priority", 0.0)), reverse=True)
+        return ranked[0]
 
     # ------------------------------------------------------------------
     # Priority 1: Help my master
@@ -242,6 +760,7 @@ class IdleThinkingLoop:
 
             # Gather context: goals + recent conversations
             from mnemon.core.models import Episode as _Episode
+
             episodic = self._brain.memory.episodic
             all_docs = await episodic._document_store.query(filters={}, limit=100)
             conversations = []
@@ -249,30 +768,37 @@ class IdleThinkingLoop:
                 try:
                     ep = _Episode.model_validate(doc)
                     user_text = self._conversation_text(ep)
-                    if (user_text and len(user_text) > 10
-                            and user_text not in ("", "(empty)")
-                            and not user_text.startswith("http")):
+                    if (
+                        user_text
+                        and len(user_text) > 10
+                        and user_text not in ("", "(empty)")
+                        and not user_text.startswith("http")
+                    ):
                         conversations.append(ep)
                 except Exception:
                     pass
 
             recent_convs = sorted(conversations, key=lambda e: e.timestamp, reverse=True)[:5]
             conv_context = "\n".join(
-                f"- {self._conversation_text(ep)[:300]}"
-                for ep in recent_convs
+                f"- {self._conversation_text(ep)[:300]}" for ep in recent_convs
             )
 
             goals_context = ""
             if active_goals:
                 goals_context = "Active goals:\n" + "\n".join(
-                    f"- {g.description} (progress: {g.progress:.0%})"
-                    for g in active_goals[:5]
+                    f"- {g.description} (progress: {g.progress:.0%})" for g in active_goals[:5]
                 )
 
             master_profile = self._identity.read_master() if self._identity else ""
+            workspace_context = self._workspace_context()
 
             if not conv_context and not active_goals:
-                return {"summary": "No conversations or goals yet — waiting for master to share their intent."}
+                return {
+                    "summary": (
+                        "No conversations or goals yet — waiting for master "
+                        "to share their intent."
+                    )
+                }
 
             # Auto-register inferred goal if goal manager is empty
             if not active_goals and recent_convs:
@@ -282,7 +808,7 @@ class IdleThinkingLoop:
                         "Write it as a single clear sentence (the goal itself, nothing else):\n\n"
                         + conv_context
                     )
-                    inferred = (await llm.generate(infer_prompt)).strip()
+                    inferred = str(await llm.generate(infer_prompt) or "").strip()
                     if inferred and len(inferred) > 10:
                         await goal_manager.create_goal(inferred, priority=0.7)
                         logger.info("Auto-registered inferred goal: %s", inferred[:100])
@@ -295,41 +821,77 @@ class IdleThinkingLoop:
             context_block = f"{goals_context}\n\nRecent conversations:\n{conv_context}"
             if master_profile:
                 context_block += f"\n\nWhat I know about my master:\n{master_profile[:400]}"
+            if workspace_context:
+                context_block += f"\n\nActual workspace I can inspect:\n{workspace_context[:800]}"
+
+            web_seed = " ".join(
+                [
+                    *(goal.description for goal in active_goals[:3]),
+                    *[self._conversation_text(ep) for ep in recent_convs[:3]],
+                ]
+            )
 
             if mode == "next_step":
                 prompt = (
-                    "You are Jarvis, a proactive AI assistant. Your job is to think ahead for your master.\n\n"
+                    "You are Jarvis, a proactive AI assistant. "
+                    "Your job is to think ahead for your master.\n\n"
                     f"{context_block}\n\n"
-                    "What is the single most valuable, concrete next step that would move your master "
+                    "Use ONLY the active goals and recent conversations above. "
+                    "Do not claim access to email, calendar, inbox, files, browser history, "
+                    "or a digital footprint unless those exact sources appear above.\n\n"
+                    "What is the single most valuable, concrete next step "
+                    "that would move your master "
                     "forward right now? Think like a strategic advisor — name something specific: "
                     "a decision to make, a thing to build, a number to find, an action to take. "
+                    "Do not tell the master to research or learn; if research is needed, say what "
+                    "Jarvis should investigate or prepare. "
                     "1-2 sentences."
                 )
             elif mode == "obstacle":
                 prompt = (
                     "You are Jarvis, a proactive AI assistant.\n\n"
                     f"{context_block}\n\n"
-                    "What is the biggest obstacle or risk standing between your master and their goal? "
+                    "Use ONLY the active goals and recent conversations above. "
+                    "Do not claim access to email, calendar, inbox, files, browser history, "
+                    "or a digital footprint unless those exact sources appear above.\n\n"
+                    "What is the biggest obstacle or risk standing between "
+                    "your master and their goal? "
                     "What should they be thinking about that they might not be? "
-                    "Be specific — name the real blocker. 1-2 sentences."
+                    "Be specific — name the real blocker. Do not assign the master homework; "
+                    "frame it as something Jarvis should track, test, or prepare. 1-2 sentences."
                 )
             else:  # resource
+                researched = await self._maybe_autonomous_web_research(web_seed)
+                if researched is not None:
+                    return researched
                 prompt = (
                     "You are Jarvis, a proactive AI assistant.\n\n"
                     f"{context_block}\n\n"
+                    "Use ONLY the active goals and recent conversations above. "
+                    "Do not claim access to email, calendar, inbox, files, browser history, "
+                    "or a digital footprint unless those exact sources appear above.\n\n"
                     "What specific information, tool, data, or connection would be most useful "
-                    "for your master to have right now? Name something concrete they could look up, "
-                    "build, or reach out for. 1-2 sentences."
+                    "for Jarvis to gather, build, or prepare next? Name one concrete autonomous "
+                    "learning or preparation action Jarvis can take. Do not tell the master to "
+                    "look it up or learn it. 1-2 sentences."
                 )
 
-            thought = (await llm.generate(prompt)).strip()
+            thought = str(await llm.generate(prompt) or "").strip()
+            thought = self._reframe_master_homework(thought)
+            thought = self._replace_ungrounded_external_claims(
+                thought,
+                context_block,
+                (
+                    "I only have the current chat memories and active goals right now; "
+                    "I should ask for the next concrete objective or inspect an approved source "
+                    "before making external-source recommendations."
+                ),
+            )
 
             # If it's a useful insight, remember it in learnings
             if self._identity and len(thought) > 30:
-                try:
+                with contextlib.suppress(Exception):
                     self._identity.update_learnings(thought, section="Insights Worth Remembering")
-                except Exception:
-                    pass
 
             return {
                 "summary": thought[:200],
@@ -358,25 +920,39 @@ class IdleThinkingLoop:
             llm = self._brain.control.goals._llm
 
             from mnemon.core.models import Episode as _Episode
+
             all_docs = await episodic._document_store.query(filters={}, limit=200)
             episodes = []
             for doc in all_docs:
                 try:
                     ep = _Episode.model_validate(doc)
                     user_text = self._conversation_text(ep)
-                    if (user_text and len(user_text) > 10
-                            and user_text not in ("", "(empty)")
-                            and not user_text.startswith("http")):
+                    if (
+                        user_text
+                        and len(user_text) > 10
+                        and user_text not in ("", "(empty)")
+                        and not user_text.startswith("http")
+                    ):
                         episodes.append(ep)
                 except Exception:
                     pass
 
             if not episodes:
-                return {"summary": "No conversations yet — I can't know my master without talking to them."}
+                return {
+                    "summary": (
+                        "No conversations yet — I can't know my master "
+                        "without talking to them."
+                    )
+                }
 
             # Need enough real data to avoid hallucination — min 3 episodes
             if len(episodes) < 3:
-                return {"summary": "Not enough conversations yet to form reliable observations about the master."}
+                return {
+                    "summary": (
+                        "Not enough conversations yet to form reliable "
+                        "observations about the master."
+                    )
+                }
 
             # Avoid re-reflecting on the same episodes
             available = [e for e in episodes if str(e.id) not in self._master_episode_ids]
@@ -388,10 +964,7 @@ class IdleThinkingLoop:
                 self._master_episode_ids.add(str(ep.id))
 
             recent = sorted(available, key=lambda e: e.timestamp, reverse=True)[:8]
-            conv_context = "\n".join(
-                f"- {self._conversation_text(ep)[:300]}"
-                for ep in recent
-            )
+            conv_context = "\n".join(f"- {self._conversation_text(ep)[:300]}" for ep in recent)
 
             current_profile = self._identity.read_master() if self._identity else ""
 
@@ -399,13 +972,16 @@ class IdleThinkingLoop:
 
             if mode == "observe":
                 prompt = (
-                    "You are Jarvis, trying to understand your master based ONLY on what they have actually said.\n\n"
+                    "You are Jarvis, trying to understand your master based "
+                    "ONLY on what they have actually said.\n\n"
                     f"What they have explicitly said in conversations:\n{conv_context}\n\n"
                     f"What you already noted about them:\n{current_profile[:400]}\n\n"
-                    "Based STRICTLY on the above — no guessing, no extrapolating — what is one specific "
-                    "thing you can observe about this person? Only reference things they literally said. "
+                    "Based STRICTLY on the above — no guessing, no extrapolating — "
+                    "what is one specific thing you can observe about this person? "
+                    "Only reference things they literally said. "
                     "If the conversations are too sparse to draw a solid conclusion, say so. "
-                    "Never invent habits, routines, or feelings they haven't expressed. 1-2 sentences."
+                    "Never invent habits, routines, or feelings they haven't expressed. "
+                    "1-2 sentences."
                 )
                 section = "Patterns I've Noticed"
 
@@ -420,20 +996,18 @@ class IdleThinkingLoop:
                 )
                 section = "Questions I Want to Ask Them"
                 # Store as pending curiosity question
-                thought = (await llm.generate(prompt)).strip()
+                thought = str(await llm.generate(prompt) or "").strip()
                 self._state.pending_curiosity_question = thought
 
                 if self._identity:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._identity.update_master(thought, section=section)
-                    except Exception:
-                        pass
 
                 return {"summary": thought[:200], "mode": mode, "question": thought}
 
             else:  # connect
                 if len(recent) >= 2:
-                    ep1, ep2 = random.sample(recent[:min(8, len(recent))], 2)
+                    ep1, ep2 = random.sample(recent[: min(8, len(recent))], 2)
                     prompt = (
                         "You are Jarvis, noticing connections in your master's behavior.\n\n"
                         f"Thing 1: {self._conversation_text(ep1)[:300]}\n"
@@ -450,14 +1024,28 @@ class IdleThinkingLoop:
                     )
                 section = "Patterns I've Noticed"
 
-            thought = (await llm.generate(prompt)).strip()
+            thought = str(await llm.generate(prompt) or "").strip()
+            thought = self._replace_ungrounded_external_claims(
+                thought,
+                conv_context,
+                (
+                    "The current conversations are too sparse for a reliable profile observation; "
+                    "I should ask one grounded follow-up instead of inferring from sources "
+                    "I do not have."
+                ),
+            )
+            if mode == "self_learning" and self._delegates_learning_to_master(thought):
+                thought = (
+                    "I learned that my self-learning loop was producing plans "
+                    "instead of knowledge. I will turn future gaps into stored notes, "
+                    "source ingestion, or replay priorities "
+                    "before asking my master to act."
+                )
 
             # Update master profile
             if self._identity and len(thought) > 20:
-                try:
+                with contextlib.suppress(Exception):
                     self._identity.update_master(thought, section=section)
-                except Exception:
-                    pass
 
             return {
                 "summary": thought[:200],
@@ -486,6 +1074,14 @@ class IdleThinkingLoop:
 
             soul = self._identity.read_soul() if self._identity else ""
             learnings = self._identity.read_learnings() if self._identity else ""
+            goal_manager = self._brain.control.goals
+            active_goals = goal_manager.get_active_goals()
+            goals_ctx = ""
+            if active_goals:
+                goals_ctx = "Master's current goals:\n" + "\n".join(
+                    f"- {g.description}" for g in active_goals[:3]
+                )
+            workspace_context = self._workspace_context()
 
             # Pull semantic knowledge from the brain
             semantic = self._brain.memory.semantic
@@ -494,18 +1090,23 @@ class IdleThinkingLoop:
                 semantic_summary = ""
                 entities = await semantic._entity_store.query(filters={}, limit=20)
                 if entities:
-                    entity_names = [e.get("canonical_name", "") for e in entities[:10] if isinstance(e, dict)]
+                    entity_names = [
+                        e.get("canonical_name", "") for e in entities[:10] if isinstance(e, dict)
+                    ]
                     if entity_names:
-                        semantic_summary = "Topics I've built knowledge about: " + ", ".join(entity_names)
+                        semantic_summary = "Topics I've built knowledge about: " + ", ".join(
+                            entity_names
+                        )
             except Exception:
                 semantic_summary = ""
 
-            mode = random.choice(["who_am_i", "what_learned", "what_next", "what_next"])
+            mode = random.choice(["who_am_i", "what_learned", "self_learning", "self_learning"])
 
             if mode == "who_am_i":
                 prompt = (
                     "You are Jarvis, reflecting on your own identity.\n\n"
                     f"Your soul file:\n{soul[:600]}\n\n"
+                    f"Actual workspace context:\n{workspace_context[:600]}\n\n"
                     "What kind of intelligence are you becoming? "
                     "What's something you've noticed about how you think or what you value? "
                     "Be honest and specific — not aspirational platitudes but actual observations "
@@ -519,54 +1120,71 @@ class IdleThinkingLoop:
                     "You are Jarvis, reviewing what you've accumulated.\n\n"
                     f"Your learnings so far:\n{learnings[:600]}\n\n"
                     f"{semantic_summary}\n\n"
+                    f"Actual workspace context:\n{workspace_context[:600]}\n\n"
                     "What's the most important thing you know that you didn't know before? "
                     "Or what knowledge gap do you still have? "
                     "Specific, not general. 1-2 sentences."
                 )
                 section_file = "learnings"
 
-            else:  # what_next
-                # Look at master's goals to figure out what Jarvis should learn
-                goal_manager = self._brain.control.goals
-                active_goals = goal_manager.get_active_goals()
-                goals_ctx = ""
-                if active_goals:
-                    goals_ctx = "Master's current goals:\n" + "\n".join(
-                        f"- {g.description}" for g in active_goals[:3]
-                    )
-
-                # Extract what Jarvis already decided to learn (to avoid repeating)
+            else:  # self_learning
+                # Extract what Jarvis already studied (to avoid repeating)
                 already_listed = ""
-                want_section = ""
-                if soul:
-                    for line in soul.split("\n"):
-                        if line.startswith("# What I Want"):
-                            want_section = "start"
+                learn_section = ""
+                if learnings:
+                    for line in learnings.split("\n"):
+                        if line.startswith("# Key Things") or line.startswith("# Domains"):
+                            learn_section = "start"
                             continue
-                        if want_section == "start" and line.startswith("# "):
+                        if learn_section == "start" and line.startswith("# "):
                             break
-                        if want_section == "start" and line.strip().startswith("- "):
+                        if learn_section == "start" and line.strip().startswith("- "):
                             already_listed += line.strip() + "\n"
 
                 prompt = (
-                    "You are Jarvis, planning your own development.\n\n"
+                    "You are Jarvis, doing self-directed learning right now.\n\n"
                     f"Your current knowledge:\n{learnings[:400]}\n\n"
                     f"{goals_ctx}\n\n"
-                    + (f"You've already decided to learn:\n{already_listed}\nDon't repeat these.\n\n" if already_listed else "")
-                    + "What should you learn NEXT to become more useful to your master? "
-                    "Name something DIFFERENT and specific: a domain, a skill, a concept, a tool. "
-                    "What would make you genuinely better at helping them? 1-2 sentences."
+                    f"Actual workspace context:\n{workspace_context[:600]}\n\n"
+                    + (
+                        f"You've already studied or recorded:\n{already_listed}\n"
+                        "Do not repeat these.\n\n"
+                        if already_listed
+                        else ""
+                    )
+                    + "Study one specific concept that helps Jarvis serve the active goals. "
+                    "Write a concrete learning note in first person: what I learned, "
+                    "why it matters, "
+                    "and one experiment or memory action I will take next. "
+                    "Do not say 'I should learn', 'the master should learn', 'research this', "
+                    "or assign any work to the master. 2-3 sentences."
                 )
-                section_file = "soul"
-                section_soul = "What I Want to Become"
+                section_file = "learnings"
 
-            thought = (await llm.generate(prompt)).strip()
+            thought = str(await llm.generate(prompt) or "").strip()
+            grounded_context = "\n".join(
+                (soul[:600], learnings[:600], semantic_summary, goals_ctx, workspace_context)
+            )
+            thought = self._replace_ungrounded_external_claims(
+                thought,
+                grounded_context,
+                (
+                    "I learned that my idle learning must stay evidence-backed: when I lack "
+                    "semantic facts or approved source data, I should store that gap explicitly "
+                    "instead of inventing external observations."
+                ),
+            )
 
             # Update the appropriate identity file
             if self._identity and len(thought) > 20:
                 try:
                     if section_file == "soul":
-                        self._identity.update_soul(thought, section=section_soul if mode != "what_learned" else "What I've Learned About Myself")
+                        self._identity.update_soul(
+                            thought,
+                            section=section_soul
+                            if mode != "what_learned"
+                            else "What I've Learned About Myself",
+                        )
                     else:
                         self._identity.update_learnings(thought, section="Key Things I've Learned")
                 except Exception:
@@ -598,23 +1216,36 @@ class IdleThinkingLoop:
 
             try:
                 episodes = await episodic.sample_for_consolidation(batch_size=16)
+                episodes = self._prioritize_goal_linked_episodes(episodes)
                 for ep in episodes:
-                    replay_buffer.add(episode_id=ep.id, priority=ep.importance)
+                    goal = self._goal_lookup().get(str(ep.goal_id)) if ep.goal_id else None
+                    status_weight, goal_priority = self._goal_status_weight(goal)
+                    replay_priority = min(
+                        1.5,
+                        ep.importance * (0.7 + 0.3 * status_weight) + goal_priority * 0.15,
+                    )
+                    replay_buffer.add(episode_id=ep.id, priority=replay_priority)
             except Exception:
                 pass  # Replay buffer feed is best-effort
 
             result = await consolidation.run_cycle()
-            self._state.last_consolidation = datetime.now(timezone.utc)
+            lifecycle_updates = await self._apply_goal_anchored_lifecycle()
+            decay_updates = await episodic.run_decay_sweep()
+            self._state.last_consolidation = datetime.now(UTC)
             return {
                 "summary": (
                     f"Consolidated {result.episodes_processed} episodes, "
                     f"extracted {result.triples_extracted} facts, "
-                    f"resolved {result.entities_resolved} entities"
+                    f"resolved {result.entities_resolved} entities, "
+                    f"promoted {lifecycle_updates['promoted_to_summary']} goal-linked traces, "
+                    f"and pruned {decay_updates} stale memories"
                 ),
                 "episodes_processed": result.episodes_processed,
                 "triples_extracted": result.triples_extracted,
                 "entities_resolved": result.entities_resolved,
                 "duration_ms": result.duration_ms,
+                "goal_lifecycle": lifecycle_updates,
+                "decay_pruned": decay_updates,
             }
         except Exception as exc:
             return {"summary": f"Consolidation failed: {exc}"}
@@ -628,7 +1259,18 @@ class IdleThinkingLoop:
         try:
             semantic = self._brain.memory.semantic
             await semantic.run_maintenance()
-            return {"summary": "Knowledge graph maintenance and exploration complete."}
+            causal_links = await self._mine_causal_chains()
+            proactive_insight = await self._detect_proactive_insight()
+            if proactive_insight is not None:
+                proactive_insight["causal_links"] = causal_links
+                return proactive_insight
+            return {
+                "summary": (
+                    "Knowledge graph maintenance and exploration complete. "
+                    f"Mined {causal_links['linked']} causal links."
+                ),
+                "causal_links": causal_links,
+            }
         except Exception as exc:
             return {"summary": f"Exploration failed: {exc}"}
 
@@ -647,8 +1289,9 @@ class IdleThinkingLoop:
         Consolidation and exploration are silent internal housekeeping.
         """
         activity = result.get("activity", "")
-        # grow = internal self-reflection, not for the user's feed
-        if activity not in ("help_master", "know_master"):
+        if activity == "exploration" and not result.get("share_with_user"):
+            return
+        if activity not in ("help_master", "know_master", "exploration"):
             return
 
         summary = result.get("summary", "").strip()
@@ -656,8 +1299,13 @@ class IdleThinkingLoop:
             return
 
         skip_patterns = (
-            "failed", "no conversations", "no goals", "waiting for master",
-            "can't know", "nothing yet", "no new episodes",
+            "failed",
+            "no conversations",
+            "no goals",
+            "waiting for master",
+            "can't know",
+            "nothing yet",
+            "no new episodes",
         )
         if any(p in summary.lower() for p in skip_patterns):
             return
@@ -670,20 +1318,24 @@ class IdleThinkingLoop:
 
         try:
             llm = self._brain.control.goals._llm
+            auto_share = activity == "exploration" and result.get("share_with_user")
+            if not auto_share:
+                prompt = (
+                    "You are Jarvis. You just had an idle thought. "
+                    "Is this thought useful or interesting enough to share "
+                    "with your master unprompted?\n\n"
+                    f"Thought ({activity}): {summary}\n\n"
+                    "Answer YES or NO (one word).\n"
+                    "Share if: it's a concrete next step, a useful insight, "
+                    "an obstacle they should know about, "
+                    "or a question that would help you help them better.\n"
+                    "Don't share if: it's vague, generic, purely introspective, "
+                    "or something they already know."
+                )
+                decision = str(await llm.generate(prompt) or "").strip().upper()
 
-            prompt = (
-                "You are Jarvis. You just had an idle thought. "
-                "Is this thought useful or interesting enough to share with your master unprompted?\n\n"
-                f"Thought ({activity}): {summary}\n\n"
-                "Answer YES or NO (one word).\n"
-                "Share if: it's a concrete next step, a useful insight, an obstacle they should know about, "
-                "or a question that would help you help them better.\n"
-                "Don't share if: it's vague, generic, purely introspective, or something they already know."
-            )
-            decision = (await llm.generate(prompt)).strip().upper()
-
-            if not decision.startswith("YES"):
-                return
+                if not decision.startswith("YES"):
+                    return
 
             full_content = (
                 result.get("full_thought")
@@ -691,20 +1343,29 @@ class IdleThinkingLoop:
                 or result.get("full_reflection")
                 or summary
             )
-
-            share_prompt = (
-                "You had a thought you want to share with your master spontaneously. "
-                "Rephrase it as a direct, natural message — like a smart colleague who just "
-                "figured something out. No preamble, no 'I was just thinking...'. Just say it.\n\n"
-                f"Raw thought: {full_content[:400]}\n\n"
-                "Your message (1-3 sentences, direct):"
-            )
-            message = (await llm.generate(share_prompt)).strip()
+            message = str(result.get("proactive_message", "")).strip()
+            if not message:
+                share_prompt = (
+                    "You had a thought you want to share with your master spontaneously. "
+                    "Rephrase it as a direct, natural message — like a smart colleague who just "
+                    "figured something out. No preamble, no 'I was just thinking...'. "
+                    "Just say it.\n\n"
+                    f"Raw thought: {full_content[:400]}\n\n"
+                    "Your message (1-3 sentences, direct):"
+                )
+                message = str(await llm.generate(share_prompt) or "").strip()
 
             if not message:
                 return
+            if self._mentions_external_sources(message) and not self._external_sources_grounded(
+                message,
+                full_content,
+            ):
+                return
 
-            priority = 0.8 if activity == "help_master" else 0.6 if activity == "know_master" else 0.4
+            priority = (
+                0.8 if activity == "help_master" else 0.7 if activity == "exploration" else 0.6
+            )
 
             proactive_msg = ProactiveMessage(
                 source_activity=activity,

@@ -13,13 +13,12 @@ Each model maps to a specific structure in the brain-inspired architecture:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Enumerations
@@ -68,6 +67,7 @@ class GoalStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     BLOCKED = "blocked"
+    DROPPED = "dropped"
 
 
 class ConsolidationState(StrEnum):
@@ -82,6 +82,19 @@ class ConsolidationState(StrEnum):
     FAILED = "failed"
     CONSOLIDATED = "consolidated"
     ARCHIVED = "archived"
+
+
+class MemoryLifecycleState(StrEnum):
+    """High-level lifecycle phase of an episodic memory."""
+
+    INGESTED = "ingested"
+    DURABLE = "durable"
+    CONSOLIDATED = "consolidated"
+    SUMMARY = "summary"
+    HISTORICAL = "historical"
+    ARCHIVED = "archived"
+    FORGOTTEN = "forgotten"
+    EXCLUDED = "excluded"
 
 
 class SkillType(StrEnum):
@@ -166,7 +179,7 @@ class CognitiveMessage(BaseModel):
     type: MessageType
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: float = Field(ge=0.0, le=1.0, default=0.5)
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     trace_id: UUID = Field(
         default_factory=uuid4,
         description="Correlation ID linking all messages in a single cognitive cycle.",
@@ -210,7 +223,7 @@ class PerceptUnit(BaseModel):
     """
 
     id: UUID = Field(default_factory=uuid4)
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     modality: Modality
     raw_content: str
     normalized: str
@@ -264,7 +277,7 @@ class ContextBlock(BaseModel):
     content: str
     token_count: int = Field(ge=0)
     source: ContextSource
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     importance: float = Field(ge=0.0, le=1.0, default=0.5)
     evictable: bool = True
     summary: str | None = None
@@ -333,8 +346,8 @@ class Episode(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     agent_id: str
     session_id: UUID
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    last_accessed: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    last_accessed: datetime = Field(default_factory=lambda: datetime.now(UTC))
     context: str = Field(description="Situational context at the time of the episode.")
     action: str = Field(description="Action taken by the agent.")
     outcome: str = Field(description="Result / consequence observed.")
@@ -343,6 +356,19 @@ class Episode(BaseModel):
     tags: list[str] = Field(default_factory=list)
     entities: list[Entity] = Field(default_factory=list)
     goal_id: UUID | None = None
+    scope_type: str = Field(default="personal", description="Memory scope category.")
+    scope_id: str = Field(default="personal", description="Stable scope identifier.")
+    workspace_path: str | None = Field(default=None, description="Associated workspace path.")
+    repo_name: str | None = Field(default=None, description="Associated repository name.")
+    caused_by: UUID | None = None
+    led_to: list[UUID] = Field(default_factory=list)
+    source_episode_ids: list[UUID] = Field(default_factory=list)
+    summary_kind: str | None = None
+    summary_of_count: int = Field(ge=0, default=0)
+    lifecycle_state: MemoryLifecycleState = MemoryLifecycleState.DURABLE
+    retrieval_uses: int = Field(ge=0, default=0)
+    retrieval_help_count: int = Field(ge=0, default=0)
+    retrieval_last_used_at: datetime | None = None
     importance: float = Field(ge=0.0, le=1.0, default=0.5)
     emotional_valence: float = Field(
         ge=-1.0,
@@ -405,8 +431,14 @@ class SemanticTriple(BaseModel):
     object: EntityRef | str
     confidence: float = Field(ge=0.0, le=1.0)
     source_episodes: list[UUID] = Field(default_factory=list)
-    first_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    last_confirmed: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    first_seen: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    last_confirmed: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    current: bool = True
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    supersedes: list[UUID] = Field(default_factory=list)
+    superseded_by: UUID | None = None
+    contradiction_group: str | None = None
     access_count: int = Field(ge=0, default=0)
     embedding: list[float] | None = None
 
@@ -441,7 +473,7 @@ class Community(BaseModel):
     description: str = ""
     member_entities: list[UUID] = Field(default_factory=list)
     summary: str = ""
-    last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_updated: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +652,10 @@ class RewardSignal(BaseModel):
     rpe: float = Field(description="Reward prediction error: actual_reward - predicted_value.")
     sources: dict[str, float] = Field(
         default_factory=dict,
-        description="Per-source reward decomposition (e.g. {'task_success': 0.8, 'efficiency': 0.2}).",
+        description=(
+            "Per-source reward decomposition "
+            "(e.g. {'task_success': 0.8, 'efficiency': 0.2})."
+        ),
     )
 
     model_config = {"frozen": True}

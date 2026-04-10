@@ -9,14 +9,14 @@ resumes from this baseline rather than starting from scratch.
 
 from __future__ import annotations
 
-import json
 import logging
-from collections import deque
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +24,10 @@ logger = logging.getLogger(__name__)
 class ThoughtEntry(BaseModel):
     """A single recorded idle thinking result."""
 
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    activity: str = Field(description="Type of idle activity: consolidation, reflection, planning, exploration.")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    activity: str = Field(
+        description="Type of idle activity: consolidation, reflection, planning, exploration."
+    )
     summary: str = Field(description="Brief summary of what was thought/discovered.")
     details: dict[str, Any] = Field(default_factory=dict)
 
@@ -40,8 +42,10 @@ class ProactiveMessage(BaseModel):
     """
 
     id: str = Field(default_factory=lambda: __import__("uuid").uuid4().hex[:8])
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    source_activity: str = Field(description="Which idle activity generated this (reflection/wandering/planning).")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    source_activity: str = Field(
+        description="Which idle activity generated this (reflection/wandering/planning)."
+    )
     content: str = Field(description="The message Jarvis wants to share.")
     priority: float = Field(default=0.5, ge=0.0, le=1.0)
     read: bool = Field(default=False)
@@ -62,7 +66,7 @@ class DaemonState(BaseModel):
     """
 
     daemon_started_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
+        default_factory=lambda: datetime.now(UTC)
     )
     total_cycles: int = 0
     total_idle_ticks: int = 0
@@ -109,7 +113,7 @@ class DaemonState(BaseModel):
             self.observer_stats[observer_name] = ObserverStats()
         stats = self.observer_stats[observer_name]
         stats.events_observed += 1
-        stats.last_event_at = datetime.now(timezone.utc)
+        stats.last_event_at = datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------

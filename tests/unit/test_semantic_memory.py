@@ -66,3 +66,67 @@ async def test_similarity_search_rebuilds_missing_vectors_from_documents(config)
     assert len(results) == 1
     assert results[0].id == triple.id
     assert await vector_store.count() == 1
+
+
+async def test_upsert_triples_marks_older_conflicting_fact_historical(config) -> None:
+    store, _vector_store, document_store = _make_store(config)
+
+    first = SemanticTriple(
+        subject=EntityRef(entity_id=uuid4(), name="Rohit"),
+        predicate="uses_provider",
+        object="OpenAI",
+        confidence=0.8,
+        embedding=await store._embedder.embed("Rohit uses_provider OpenAI"),
+    )
+    second = SemanticTriple(
+        subject=first.subject,
+        predicate="uses_provider",
+        object="Anthropic",
+        confidence=0.9,
+        embedding=await store._embedder.embed("Rohit uses_provider Anthropic"),
+    )
+
+    await store.upsert_triples([first])
+    await store.upsert_triples([second])
+
+    first_doc = await document_store.get(first.id)
+    second_doc = await document_store.get(second.id)
+
+    assert first_doc is not None
+    assert second_doc is not None
+    assert first_doc["current"] is False
+    assert first_doc["superseded_by"] == str(second.id)
+    assert first_doc["valid_to"] is not None
+    assert second_doc["current"] is True
+    assert second_doc["supersedes"] == [str(first.id)]
+    assert second_doc["contradiction_group"] is not None
+
+
+async def test_similarity_search_prefers_current_fact_over_historical(config) -> None:
+    store, _vector_store, _document_store = _make_store(config)
+
+    first = SemanticTriple(
+        subject=EntityRef(entity_id=uuid4(), name="Rohit"),
+        predicate="uses_provider",
+        object="OpenAI",
+        confidence=0.8,
+        embedding=await store._embedder.embed("Rohit uses_provider OpenAI"),
+    )
+    second = SemanticTriple(
+        subject=first.subject,
+        predicate="uses_provider",
+        object="Anthropic",
+        confidence=0.9,
+        embedding=await store._embedder.embed("Rohit uses_provider Anthropic"),
+    )
+
+    await store.upsert_triples([first])
+    await store.upsert_triples([second])
+
+    query_embedding = await store._embedder.embed("What provider does Rohit use now?")
+    results = await store.retrieve_by_similarity(query_embedding, top_k=5)
+
+    assert len(results) >= 2
+    assert results[0].object == "Anthropic"
+    assert results[0].current is True
+    assert results[1].current is False

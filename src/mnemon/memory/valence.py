@@ -11,12 +11,14 @@ the basolateral–central amygdala circuit dynamics underlying fear extinction.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from uuid import uuid4
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-from mnemon.core.config import ValenceConfig
 from mnemon.core.interfaces import EmbeddingProvider, ValenceMemoryInterface
 from mnemon.core.models import PerceptUnit, SalienceScore, ValenceAssociation
+
+if TYPE_CHECKING:
+    from mnemon.core.config import ValenceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +136,7 @@ class ValenceMemoryStore(ValenceMemoryInterface):
         that the association is tentative until further reinforcement.
         """
         lr = self._config.learning_rate
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         for trigger in triggers:
             if trigger in self._store:
@@ -190,7 +192,7 @@ class ValenceMemoryStore(ValenceMemoryInterface):
         Returns the total count of associations weakened or removed.
         """
         rate = self._config.extinction_rate
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         one_hour_s = 3_600.0
         affected = 0
 

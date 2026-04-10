@@ -17,7 +17,6 @@ import pytest
 
 from mnemon.learning.replay import PrioritizedReplayBuffer, ReplayExperience, SumTree
 
-
 # ---------------------------------------------------------------------------
 # SumTree
 # ---------------------------------------------------------------------------
@@ -167,6 +166,18 @@ class TestPrioritizedReplayBuffer:
             buf.add(uuid4(), 1.0)
         samples = buf.sample(10)  # request more than available
         assert len(samples) == 3
+
+    def test_full_buffer_sample_returns_each_active_episode_once(self) -> None:
+        buf = PrioritizedReplayBuffer(capacity=8, alpha=1.0)
+        episode_ids = [uuid4() for _ in range(3)]
+        priorities = [0.7, 0.8, 2.0]
+        for episode_id, priority in zip(episode_ids, priorities, strict=True):
+            buf.add(episode_id, priority)
+
+        samples = buf.sample(32)
+
+        assert len(samples) == len(episode_ids)
+        assert {sample.episode_id for sample in samples} == set(episode_ids)
 
     def test_sample_is_weights_are_in_valid_range(self) -> None:
         buf = PrioritizedReplayBuffer(capacity=16, alpha=0.6, beta_start=0.4)

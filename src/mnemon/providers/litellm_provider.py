@@ -392,7 +392,10 @@ class LiteLLMEmbeddingProvider(EmbeddingProvider):
         # Reject empty strings — they cause API errors and break index alignment
         for i, t in enumerate(texts):
             if not t.strip():
-                raise ValueError(f"Empty string at index {i} in embed_batch; all texts must be non-empty.")
+                raise ValueError(
+                    f"Empty string at index {i} in embed_batch; "
+                    "all texts must be non-empty."
+                )
 
         logger.debug(
             "LiteLLMEmbeddingProvider.embed_batch: model=%s, count=%d",

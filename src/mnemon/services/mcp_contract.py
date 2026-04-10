@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from mnemon.services.memory_service import MemoryService
+if TYPE_CHECKING:
+    from mnemon.services.memory_service import MemoryService
 
 RAW_TOOL_NAMES: tuple[str, ...] = (
     "memory_write",
     "memory_retrieve",
+    "memory_profile_recall",
+    "memory_explain_fact",
+    "memory_causal_trace",
     "memory_consolidate",
     "memory_state",
 )
@@ -31,8 +35,23 @@ def episodes_resource_uri(namespace: str) -> str:
     return f"memory://{clean_ns}/episodes/recent"
 
 
+def facts_resource_uri(namespace: str) -> str:
+    clean_ns = namespace.strip().replace(" ", "_") or "mnemon"
+    return f"memory://{clean_ns}/facts/recent"
+
+
+def profile_resource_uri(namespace: str) -> str:
+    clean_ns = namespace.strip().replace(" ", "_") or "mnemon"
+    return f"memory://{clean_ns}/profile/current"
+
+
 def known_resource_uris(namespace: str) -> list[str]:
-    return [state_resource_uri(namespace), episodes_resource_uri(namespace)]
+    return [
+        state_resource_uri(namespace),
+        episodes_resource_uri(namespace),
+        facts_resource_uri(namespace),
+        profile_resource_uri(namespace),
+    ]
 
 
 async def read_resource(service: MemoryService, namespace: str, uri: str) -> dict[str, Any]:
@@ -55,6 +74,22 @@ async def read_resource(service: MemoryService, namespace: str, uri: str) -> dic
             "uri": uri,
             "mime_type": "application/json",
             "text": json.dumps(payload, indent=2, default=str),
+        }
+
+    if uri == facts_resource_uri(namespace):
+        payload = await service.recent_facts(limit=10)
+        return {
+            "uri": uri,
+            "mime_type": "application/json",
+            "text": json.dumps(payload, indent=2),
+        }
+
+    if uri == profile_resource_uri(namespace):
+        payload = await service.profile_snapshot()
+        return {
+            "uri": uri,
+            "mime_type": "application/json",
+            "text": json.dumps(payload, indent=2),
         }
 
     raise ValueError(f"Unknown resource URI: {uri}")

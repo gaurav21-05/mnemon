@@ -25,13 +25,15 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
 import anyio
 import anyio.abc
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
 from mnemon.core.models import CognitiveMessage, MessageType
+
+if TYPE_CHECKING:
+    from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +72,7 @@ class EventFilter:
             return False
         if self.min_priority is not None and msg.priority < self.min_priority:
             return False
-        if self.custom_predicate is not None and not self.custom_predicate(msg):
-            return False
-        return True
+        return not (self.custom_predicate is not None and not self.custom_predicate(msg))
 
 
 # ---------------------------------------------------------------------------
@@ -90,11 +90,10 @@ class _Subscription:
     def should_handle(self, msg: CognitiveMessage) -> bool:
         """Return True if this subscription should receive *msg*."""
         # If the subscription is scoped to a module, only deliver to that module
-        if self.module_id is not None:
+        if self.module_id is not None and msg.target not in ("*", self.module_id):
             # Direct messages must match the module_id;
             # broadcast/wildcard messages go to everyone
-            if msg.target not in ("*", self.module_id):
-                return False
+            return False
         if self.event_filter is not None:
             return self.event_filter.matches(msg)
         return True

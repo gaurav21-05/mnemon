@@ -11,7 +11,7 @@ how long since the last user interaction, and can trigger time-based behaviours.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import anyio
@@ -63,7 +63,7 @@ class CronObserver(ObserverPlugin):
         if self._brain is None:
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         local_time = now.astimezone()
 
         description = (

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -104,7 +104,13 @@ async def test_git_status_and_diff_report_changes(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     target = tmp_path / "app.py"
     target.write_text("print('hello')\n", encoding="utf-8")
-    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "add", "app.py"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(
         ["git", "commit", "-m", "init"],
         cwd=tmp_path,
@@ -125,7 +131,13 @@ async def test_git_status_and_diff_report_changes(tmp_path: Path) -> None:
 async def test_create_and_remove_worktree(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     (tmp_path / "README.md").write_text("root\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(
         ["git", "commit", "-m", "init"],
         cwd=tmp_path,

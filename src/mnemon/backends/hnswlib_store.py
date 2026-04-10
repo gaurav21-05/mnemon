@@ -14,6 +14,7 @@ instantiated before the embedding dimensionality is known.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -123,28 +124,38 @@ class HNSWLibVectorStore(VectorStore):
         filters: dict[str, Any] | None = None,
     ) -> list[VectorSearchResult]:
         """Find the top_k nearest neighbours of query_embedding."""
-        if self._index is None or self._index.get_current_count() == 0:
+        active_count = len(self._id_to_label)
+        if self._index is None or active_count == 0:
             return []
 
         import numpy as np
         vec = np.array([query_embedding], dtype=np.float32)
 
-        k = min(top_k, self._index.get_current_count())
+        k = min(top_k, active_count)
         if k == 0:
             return []
 
-        labels, distances = self._index.knn_query(vec, k=k)
+        labels = distances = None
+        while k > 0:
+            try:
+                labels, distances = self._index.knn_query(vec, k=k)
+                break
+            except RuntimeError as exc:
+                if "contiguous 2D array" not in str(exc) or k == 1:
+                    raise
+                k -= 1
+        if labels is None or distances is None:
+            return []
 
         results: list[VectorSearchResult] = []
-        for label, dist in zip(labels[0], distances[0]):
+        for label, dist in zip(labels[0], distances[0], strict=False):
             str_id = self._label_to_id.get(int(label))
             if str_id is None:
                 continue
             meta = self._metadata.get(str_id, {})
 
-            if filters:
-                if not all(meta.get(k) == v for k, v in filters.items()):
-                    continue
+            if filters and not all(meta.get(k) == v for k, v in filters.items()):
+                continue
 
             # hnswlib returns L2 distance; convert to similarity score
             score = float(1.0 / (1.0 + dist))
@@ -166,10 +177,8 @@ class HNSWLibVectorStore(VectorStore):
         self._metadata.pop(str_id, None)
 
         if self._index is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._index.mark_deleted(label)
-            except Exception:
-                pass  # Some versions may not support mark_deleted
 
         self._save()
         logger.debug("HNSWLibVectorStore.delete id=%s", id)
@@ -194,10 +203,8 @@ class HNSWLibVectorStore(VectorStore):
                 self._label_to_id.pop(old_label, None)
                 self._metadata.pop(str_id, None)
                 if self._index is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._index.mark_deleted(old_label)
-                    except Exception:
-                        pass
 
             if self._index is None:
                 self._create_index(len(item.embedding))
@@ -217,9 +224,7 @@ class HNSWLibVectorStore(VectorStore):
 
     async def count(self) -> int:
         """Return the total number of vectors currently in the index."""
-        if self._index is None:
-            return 0
-        return self._index.get_current_count()
+        return len(self._id_to_label)
 
     async def clear(self) -> None:
         """Remove all vectors and delete persisted index files."""
@@ -244,7 +249,11 @@ class HNSWLibVectorStore(VectorStore):
         self._index = hnswlib.Index(space="l2", dim=dim)
         self._index.init_index(max_elements=self._max_elements, ef_construction=200, M=16)
         self._index.set_ef(50)
-        logger.debug("HNSWLibVectorStore: created index dim=%d max_elements=%d", dim, self._max_elements)
+        logger.debug(
+            "HNSWLibVectorStore: created index dim=%d max_elements=%d",
+            dim,
+            self._max_elements,
+        )
 
     def _save(self) -> None:
         """Persist index and metadata to disk."""
@@ -268,7 +277,7 @@ class HNSWLibVectorStore(VectorStore):
     def _load(self) -> None:
         """Load index and metadata from disk."""
         import hnswlib
-        with open(self._meta_path, "r", encoding="utf-8") as fh:
+        with open(self._meta_path, encoding="utf-8") as fh:
             meta = json.load(fh)
 
         self._dim = meta["dim"]

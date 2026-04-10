@@ -14,9 +14,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from mnemon.core.config import ConsolidationScheduleConfig
-
 if TYPE_CHECKING:
+    from mnemon.core.config import ConsolidationScheduleConfig
     from mnemon.core.interfaces import ConsolidationEngineInterface
 
 logger = logging.getLogger(__name__)
@@ -53,7 +52,8 @@ class ConsolidationScheduler:
     Parameters
     ----------
     config:
-        Scheduling configuration slice from :class:`~mnemon.core.config.ConsolidationScheduleConfig`.
+        Scheduling configuration slice from
+        :class:`~mnemon.core.config.ConsolidationScheduleConfig`.
     consolidation_engine:
         The engine whose :meth:`run_cycle` will be invoked on each tick.
     """

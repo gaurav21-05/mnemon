@@ -7,7 +7,7 @@ reference implementation for all backend contracts.
 
 from __future__ import annotations
 
-import math
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import pytest
@@ -17,9 +17,12 @@ from mnemon.backends.memory_store import (
     InMemoryGraphStore,
     InMemoryVectorStore,
 )
-from mnemon.core.config import MnemonConfig
 from mnemon.core.interfaces import VectorItem
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from mnemon.core.config import MnemonConfig
 
 # ---------------------------------------------------------------------------
 # InMemoryVectorStore
@@ -114,6 +117,34 @@ class TestInMemoryVectorStore:
         await self._store.insert(vid, [1.0, 0.0], {})
         results = await self._store.search([1.0, 0.0], top_k=1)
         assert results[0].id == vid
+
+
+# ---------------------------------------------------------------------------
+# HNSWLibVectorStore
+# ---------------------------------------------------------------------------
+
+
+async def test_hnsw_search_ignores_deleted_entries_when_top_k_exceeds_active_count(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("hnswlib")
+    from mnemon.backends.hnswlib_store import HNSWLibVectorStore
+
+    store = HNSWLibVectorStore(str(tmp_path / "episodic.hnsw"))
+    await store.initialize()
+
+    deleted_ids = [uuid4(), uuid4()]
+    active_id = uuid4()
+    await store.insert(deleted_ids[0], [1.0, 0.0], {})
+    await store.insert(deleted_ids[1], [0.0, 1.0], {})
+    await store.insert(active_id, [1.0, 0.0], {})
+    for deleted_id in deleted_ids:
+        await store.delete(deleted_id)
+
+    results = await store.search([1.0, 0.0], top_k=10)
+
+    assert await store.count() == 1
+    assert [item.id for item in results] == [active_id]
 
 
 # ---------------------------------------------------------------------------

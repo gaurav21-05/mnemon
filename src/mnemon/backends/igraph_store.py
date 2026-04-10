@@ -13,6 +13,7 @@ ensuring the semantic knowledge network survives process restarts.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -284,10 +285,8 @@ class IGraphGraphStore(GraphStore):
             members: list[UUID] = []
             for vtx_idx in community:
                 uuid_str = self._graph.vs[vtx_idx].attributes().get("uuid", "")
-                try:
+                with contextlib.suppress(ValueError, AttributeError):
                     members.append(UUID(uuid_str))
-                except (ValueError, AttributeError):
-                    pass
             if members:
                 communities.append(members)
 
@@ -377,7 +376,7 @@ class IGraphGraphStore(GraphStore):
     def _load(self) -> None:
         """Load graph from custom JSON format."""
         import igraph
-        with open(self._graph_path, "r", encoding="utf-8") as fh:
+        with open(self._graph_path, encoding="utf-8") as fh:
             data = json.load(fh)
 
         self._graph = igraph.Graph(directed=True)

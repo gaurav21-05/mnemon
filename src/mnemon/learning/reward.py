@@ -12,11 +12,15 @@ recently active synaptic pathways.
 from __future__ import annotations
 
 import logging
-from uuid import UUID
+from typing import TYPE_CHECKING
 
-from mnemon.core.config import RewardConfig
 from mnemon.core.interfaces import RewardProcessorInterface
 from mnemon.core.models import RewardSignal
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from mnemon.core.config import RewardConfig
 
 logger = logging.getLogger(__name__)
 

@@ -21,7 +21,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from .exceptions import ConfigError
 from .models import EvictionPolicy
 
-
 # ---------------------------------------------------------------------------
 # Sub-section configs
 # ---------------------------------------------------------------------------
@@ -119,7 +118,7 @@ class EpisodicRetrievalWeights(BaseSettings):
     importance: float = Field(default=0.1, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
-    def weights_sum_to_one(self) -> "EpisodicRetrievalWeights":
+    def weights_sum_to_one(self) -> EpisodicRetrievalWeights:
         total = self.semantic + self.bm25 + self.recency + self.importance
         if abs(total - 1.0) > 1e-6:
             raise ValueError(
@@ -254,7 +253,10 @@ class SemanticConfig(BaseSettings):
 
     graph_backend: str = Field(
         default="igraph",
-        description="Graph database backend identifier (e.g. 'falkordb', 'neo4j', 'igraph', 'memory').",
+        description=(
+            "Graph database backend identifier "
+            "(e.g. 'falkordb', 'neo4j', 'igraph', 'memory')."
+        ),
     )
     raptor: RaptorConfig = Field(default_factory=RaptorConfig)
     community_detection: CommunityDetectionConfig = Field(
@@ -468,7 +470,7 @@ class AttentionWeightsConfig(BaseSettings):
     urgency: float = Field(default=0.1, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
-    def weights_sum_to_one(self) -> "AttentionWeightsConfig":
+    def weights_sum_to_one(self) -> AttentionWeightsConfig:
         total = self.valence + self.goal_relevance + self.novelty + self.urgency
         if abs(total - 1.0) > 1e-6:
             raise ValueError(

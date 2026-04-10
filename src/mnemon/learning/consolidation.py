@@ -25,10 +25,10 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import Any
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from mnemon.core.config import ConsolidationConfig
 from mnemon.core.exceptions import ConsolidationError
 from mnemon.core.interfaces import (
     ConsolidationEngineInterface,
@@ -42,9 +42,13 @@ from mnemon.core.models import (
     ConsolidationState,
     EntityRef,
     Episode,
+    MemoryLifecycleState,
     SemanticTriple,
 )
-from mnemon.learning.replay import PrioritizedReplayBuffer
+
+if TYPE_CHECKING:
+    from mnemon.core.config import ConsolidationConfig
+    from mnemon.learning.replay import PrioritizedReplayBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +104,7 @@ def _looks_like_entity(text: str) -> bool:
         return False
     except ValueError:
         pass
-    if stripped.lower() in {"true", "false", "null", "none", "yes", "no"}:
-        return False
-    return True
+    return stripped.lower() not in {"true", "false", "null", "none", "yes", "no"}
 
 
 class ConsolidationEngine(ConsolidationEngineInterface):
@@ -202,9 +204,7 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                 continue
             valid_episodes.append((episode, experience.tree_index, experience.priority))
 
-        logger.debug(
-            "Stage 1 (SELECTION): %d valid episodes after filtering", len(valid_episodes)
-        )
+        logger.debug("Stage 1 (SELECTION): %d valid episodes after filtering", len(valid_episodes))
 
         if not valid_episodes:
             logger.info(
@@ -230,7 +230,7 @@ class ConsolidationEngine(ConsolidationEngineInterface):
         extracted_episode_ids: set[UUID] = set()
         failed_extractions: dict[UUID, int] = {}
 
-        for episode, tree_index, priority in valid_episodes:
+        for episode, _tree_index, _priority in valid_episodes:
             prompt = (
                 "Given this agent experience:\n"
                 f"Context: {episode.context}\n"
@@ -262,15 +262,12 @@ class ConsolidationEngine(ConsolidationEngineInterface):
 
             raw_triples: list[dict[str, Any]] = result.get("triples", [])
             extracted_episode_ids.add(episode.id)
-            logger.debug(
-                "Episode %s: LLM returned %d raw triples", episode.id, len(raw_triples)
-            )
+            logger.debug("Episode %s: LLM returned %d raw triples", episode.id, len(raw_triples))
 
             triples: list[SemanticTriple] = []
             # Collect triple texts for batch embedding.
             triple_texts: list[str] = [
-                f"{t['subject']} {t['predicate']} {t['object']}"
-                for t in raw_triples
+                f"{t['subject']} {t['predicate']} {t['object']}" for t in raw_triples
             ]
 
             embeddings: list[list[float]] = []
@@ -279,7 +276,8 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                     embeddings = await self._embedding.embed_batch(triple_texts)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
-                        "Embedding failed for episode %s triples — proceeding without embeddings. Error: %s",
+                        "Embedding failed for episode %s triples — proceeding without "
+                        "embeddings. Error: %s",
                         episode.id,
                         exc,
                     )
@@ -292,9 +290,7 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                 confidence: float = float(raw.get("confidence", 0.5))
 
                 if not subject_str or not predicate_str or not object_str:
-                    logger.debug(
-                        "Skipping malformed triple from episode %s: %s", episode.id, raw
-                    )
+                    logger.debug("Skipping malformed triple from episode %s: %s", episode.id, raw)
                     continue
 
                 subject_ref = _make_entity_ref(subject_str)
@@ -304,7 +300,9 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                 else:
                     object_val = object_str
 
-                embedding_vec: list[float] | None = embeddings[idx] if idx < len(embeddings) else None
+                embedding_vec: list[float] | None = (
+                    embeddings[idx] if idx < len(embeddings) else None
+                )
 
                 triple = SemanticTriple(
                     subject=subject_ref,
@@ -317,9 +315,7 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                 triples.append(triple)
 
             episode_triples[episode.id] = triples
-            logger.debug(
-                "Episode %s: built %d SemanticTriple objects", episode.id, len(triples)
-            )
+            logger.debug("Episode %s: built %d SemanticTriple objects", episode.id, len(triples))
 
         # ----------------------------------------------------------------
         # Stage 3: SEMANTIC INTEGRATION
@@ -369,8 +365,7 @@ class ConsolidationEngine(ConsolidationEngineInterface):
         # Stage 4: CLEANUP
         # ----------------------------------------------------------------
         processed_ids: list[UUID] = [
-            ep.id for ep, _, _ in valid_episodes
-            if ep.id in upserted_episode_ids
+            ep.id for ep, _, _ in valid_episodes if ep.id in upserted_episode_ids
         ]
         logger.info(
             "Stage 4 (CLEANUP): marking %d/%d episodes consolidated",
@@ -381,12 +376,8 @@ class ConsolidationEngine(ConsolidationEngineInterface):
         try:
             await self._episodic.mark_consolidated(processed_ids)
         except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "mark_consolidated failed for %d episodes: %s", len(processed_ids), exc
-            )
-            raise ConsolidationError(
-                f"Failed to mark episodes consolidated: {exc}"
-            ) from exc
+            logger.error("mark_consolidated failed for %d episodes: %s", len(processed_ids), exc)
+            raise ConsolidationError(f"Failed to mark episodes consolidated: {exc}") from exc
 
         for episode_id in processed_ids:
             await self._episodic.update(episode_id, consolidation_attempts=0)
@@ -408,10 +399,13 @@ class ConsolidationEngine(ConsolidationEngineInterface):
         # lower priority so they are not replayed again soon.
         # Episodes that yielded few triples are still information-rich; raise
         # priority slightly to encourage re-sampling.
-        max_triples_in_batch = max(
-            (len(episode_triples.get(ep.id, [])) for ep, _, _ in valid_episodes),
-            default=1,
-        ) or 1
+        max_triples_in_batch = (
+            max(
+                (len(episode_triples.get(ep.id, [])) for ep, _, _ in valid_episodes),
+                default=1,
+            )
+            or 1
+        )
 
         for episode, tree_index, original_priority in valid_episodes:
             n_triples = len(episode_triples.get(episode.id, []))
@@ -429,6 +423,11 @@ class ConsolidationEngine(ConsolidationEngineInterface):
                 original_priority,
                 new_priority,
                 n_triples,
+            )
+
+        with suppress(Exception):
+            await self._create_summary_episodes(
+                [episode for episode, _, _ in valid_episodes if episode.id in processed_ids]
             )
 
         duration_ms = (time.monotonic() - start) * 1000.0
@@ -487,6 +486,85 @@ class ConsolidationEngine(ConsolidationEngineInterface):
     # Helper methods
     # ------------------------------------------------------------------
 
+    async def _create_summary_episodes(self, episodes: list[Episode]) -> int:
+        """Create durable summary episodes for repeated related traces."""
+        groups: dict[tuple[str, str], list[Episode]] = {}
+        ignored_tags = {"auto_capture", "profile_dynamic", "profile_static", "project_context"}
+
+        for episode in episodes:
+            summary_tag = next(
+                (
+                    tag
+                    for tag in episode.tags
+                    if tag and tag not in ignored_tags and not tag.startswith("source:")
+                ),
+                None,
+            )
+            if summary_tag is None:
+                continue
+            key = (episode.scope_id, summary_tag)
+            groups.setdefault(key, []).append(episode)
+
+        created = 0
+        for (_scope_id, summary_tag), grouped in groups.items():
+            if len(grouped) < 2:
+                continue
+
+            ordered = sorted(
+                {episode.id: episode for episode in grouped}.values(),
+                key=lambda ep: ep.timestamp,
+            )
+            if len(ordered) < 2:
+                continue
+            source_ids = [episode.id for episode in ordered]
+            goal_ids = {episode.goal_id for episode in ordered if episode.goal_id is not None}
+            all_goal_linked = all(episode.goal_id is not None for episode in ordered)
+            summary_goal_id = (
+                next(iter(goal_ids)) if len(goal_ids) == 1 and all_goal_linked else None
+            )
+            lines = [
+                f"- {episode.context} | {episode.action} | {episode.outcome}"
+                for episode in ordered[:8]
+            ]
+            prompt = (
+                "Summarize these repeated related memories into one concise durable note.\n"
+                f"Tag focus: {summary_tag}\n"
+                f"Events:\n{chr(10).join(lines)}"
+            )
+            try:
+                summary_text = str(await self._llm.generate(prompt) or "").strip()
+            except Exception:
+                summary_text = ""
+            if not summary_text:
+                summary_text = (
+                    f"Summary of {len(ordered)} related '{summary_tag}' memories: "
+                    + "; ".join(episode.context for episode in ordered[:3])
+                )
+
+            summary_episode = Episode(
+                agent_id="mnemon-summary",
+                session_id=ordered[-1].session_id,
+                context=f"Summary of {len(ordered)} related memories",
+                action="Compressed episodic traces into a durable summary",
+                outcome=summary_text[:2000],
+                tags=list(dict.fromkeys([summary_tag, "summary", "compressed_memory"])),
+                importance=min(1.0, max(episode.importance for episode in ordered) + 0.1),
+                scope_type=ordered[-1].scope_type,
+                scope_id=ordered[-1].scope_id,
+                workspace_path=ordered[-1].workspace_path,
+                repo_name=ordered[-1].repo_name,
+                goal_id=summary_goal_id,
+                source_episode_ids=source_ids,
+                summary_kind="episodic_cluster",
+                summary_of_count=len(ordered),
+                lifecycle_state=MemoryLifecycleState.SUMMARY,
+                consolidation_state=ConsolidationState.CONSOLIDATED,
+            )
+            await self._episodic.encode(summary_episode)
+            created += 1
+
+        return created
+
     async def seed_replay_buffer(self) -> None:
         """Populate the replay buffer from unconsolidated episodic memory.
 
@@ -522,6 +600,4 @@ class ConsolidationEngine(ConsolidationEngineInterface):
             self._replay.add(episode.id, priority)
             added += 1
 
-        logger.info(
-            "ConsolidationEngine: seeded replay buffer with %d episodes", added
-        )
+        logger.info("ConsolidationEngine: seeded replay buffer with %d episodes", added)

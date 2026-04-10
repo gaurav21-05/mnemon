@@ -9,6 +9,7 @@ registers it, and the attention gate decides whether it warrants focus.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -80,20 +81,16 @@ class FileSystemObserver(ObserverPlugin):
             if not root.exists():
                 continue
             if root.is_file():
-                try:
+                with contextlib.suppress(OSError):
                     result[root] = root.stat().st_mtime
-                except OSError:
-                    pass
                 continue
             try:
                 for p in root.rglob("*"):
                     if p.is_file() and not any(
                         part.startswith(".") for part in p.parts
                     ):
-                        try:
+                        with contextlib.suppress(OSError):
                             result[p] = p.stat().st_mtime
-                        except OSError:
-                            pass
             except PermissionError:
                 pass
         return result

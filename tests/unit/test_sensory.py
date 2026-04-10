@@ -7,15 +7,13 @@ TTL expiry, and the peek/clear API.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from datetime import UTC, datetime
 
 import pytest
 
 from mnemon.core.config import SensoryConfig
 from mnemon.core.models import Modality, PerceptUnit
 from mnemon.memory.sensory import SensoryBuffer
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,7 +36,7 @@ def _past_percept(ttl_ms: int = 100) -> PerceptUnit:
         normalized="old",
         tokens=1,
         ttl_ms=ttl_ms,
-        timestamp=datetime(2000, 1, 1, tzinfo=timezone.utc),  # definitely expired
+        timestamp=datetime(2000, 1, 1, tzinfo=UTC),  # definitely expired
     )
 
 

@@ -20,7 +20,6 @@ import pytest
 from mnemon.core.bus import CognitiveBus, EventFilter
 from mnemon.core.models import CognitiveMessage, MessageType
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

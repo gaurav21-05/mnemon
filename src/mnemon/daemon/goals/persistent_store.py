@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from mnemon.core.models import Goal
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 

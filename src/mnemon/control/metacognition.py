@@ -12,16 +12,16 @@ calibrates the agent's confidence and selects appropriate recovery strategies.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections import deque
-from datetime import datetime, timezone
-from typing import Any
-from uuid import UUID
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
-from mnemon.core.config import MetaCognitionConfig
 from mnemon.core.interfaces import LLMProvider, MetaCognitionInterface
 from mnemon.core.models import Episode, MetaEvaluation, Strategy
+
+if TYPE_CHECKING:
+    from mnemon.core.config import MetaCognitionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +31,26 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_STRATEGIES: list[Strategy] = [
     Strategy(name="decompose", trigger="complex goal", action="break into subgoals", weight=1.0),
-    Strategy(name="retrieve_more", trigger="insufficient info", action="expand retrieval scope", weight=0.9),
-    Strategy(name="try_different", trigger="repeated failure", action="switch approach or skill", weight=0.85),
+    Strategy(
+        name="retrieve_more",
+        trigger="insufficient info",
+        action="expand retrieval scope",
+        weight=0.9,
+    ),
+    Strategy(
+        name="try_different",
+        trigger="repeated failure",
+        action="switch approach or skill",
+        weight=0.85,
+    ),
     Strategy(name="ask_user", trigger="low confidence", action="request clarification", weight=0.7),
     Strategy(name="simplify", trigger="resource pressure", action="reduce goal scope", weight=0.8),
-    Strategy(name="reflect", trigger="unexpected outcome", action="analyze and learn from surprise", weight=0.95),
+    Strategy(
+        name="reflect",
+        trigger="unexpected outcome",
+        action="analyze and learn from surprise",
+        weight=0.95,
+    ),
 ]
 
 _STRATEGY_INDEX: dict[str, Strategy] = {s.name: s for s in DEFAULT_STRATEGIES}
@@ -199,7 +214,7 @@ class MetaCognitionController(MetaCognitionInterface):
         entry: dict[str, Any] = {
             "lesson": lesson,
             "context": context,
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "recorded_at": datetime.now(UTC).isoformat(),
         }
         self._lessons.append(entry)
         logger.info("Lesson recorded: %s (context=%s)", lesson, context)
@@ -227,7 +242,7 @@ class MetaCognitionController(MetaCognitionInterface):
 
         overconfident_cycles = sum(
             1
-            for c, e in zip(conf_list, rpe_list)
+            for c, e in zip(conf_list, rpe_list, strict=False)
             if c > 0.7 and abs(e) > 0.5
         )
         paired_count = min(len(conf_list), len(rpe_list))

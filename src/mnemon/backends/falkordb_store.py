@@ -18,13 +18,13 @@ from __future__ import annotations
 import json
 import logging
 import random
-from typing import Any
+import re as _re
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import anyio
 from falkordb import FalkorDB
 
-from mnemon.core.config import MnemonConfig
 from mnemon.core.exceptions import MemoryError
 from mnemon.core.interfaces import GraphNode, GraphStore, RankedNode
 
@@ -35,10 +35,8 @@ logger = logging.getLogger(__name__)
 # Sentinel used to distinguish "key present with value None" from "key absent"
 _MISSING = object()
 
-# Allowlist pattern for Cypher identifiers (labels, relationship types).
-# FalkorDB does not support parameterised identifiers, so we reject any
-# value that could escape the Cypher syntax.
-import re as _re
+if TYPE_CHECKING:
+    from mnemon.core.config import MnemonConfig
 
 _SAFE_IDENTIFIER_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

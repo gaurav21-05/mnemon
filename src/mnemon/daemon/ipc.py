@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
-from collections import deque
+from collections import Counter, deque
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -25,9 +27,15 @@ import anyio
 import anyio.abc
 from anyio import create_unix_listener
 
+from mnemon.core.models import GoalStatus
 from mnemon.daemon.autonomy import AutonomyController, ProposedAction
-from mnemon.daemon.config import RiskLevel
+from mnemon.daemon.capture_policy import classify_interaction
+from mnemon.daemon.config import DaemonConfig, RiskLevel
+from mnemon.daemon.identity import JarvisIdentity, MasterProfile, ProfileFact
 from mnemon.daemon.improve import Phase, SelfImprovementOrchestrator
+from mnemon.daemon.privacy import apply_redactions, load_privacy_rules
+from mnemon.daemon.reports import ReportEngine
+from mnemon.daemon.scenario import ScenarioEngine
 
 if TYPE_CHECKING:
     from mnemon.daemon.state import DaemonState
@@ -218,7 +226,7 @@ def _infer_workspace_intent(message: str) -> dict[str, Any] | None:
     if lower.startswith(_EXEC_PREFIXES):
         for prefix in _EXEC_PREFIXES:
             if lower.startswith(prefix):
-                command = stripped[len(prefix):]
+                command = stripped[len(prefix) :]
                 return {"tool": "exec", "command": _strip_wrapping_quotes(command)}
 
     if lower.startswith(("run `", "execute `")) and backticked:
@@ -388,6 +396,7 @@ def _looks_like_agentic_tool_request(message: str) -> bool:
         return True
     return bool(_extract_backticked_chunks(message))
 
+
 # Jarvis persona — base system prompt, memory context injected per-call
 _JARVIS_SYSTEM_BASE = """\
 You are Jarvis, a personal AI companion. You are direct, honest, and genuinely useful.
@@ -446,6 +455,7 @@ class DaemonIPCServer:
         self._autonomy = autonomy
         self._idle_loop = idle_loop
         self._running = False
+        self._task_group: anyio.abc.TaskGroup | None = None
         # Rolling conversation history — last 20 turns (user+assistant pairs)
         self._chat_history: deque[dict[str, str]] = deque(maxlen=40)
         # Lazy-initialised browser tool
@@ -454,12 +464,32 @@ class DaemonIPCServer:
         self._pending_tool_actions: dict[UUID, dict[str, Any]] = {}
         self._improver: SelfImprovementOrchestrator | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._scenario_engine: ScenarioEngine | None = None
+        self._report_engine: ReportEngine | None = None
         self._handlers: dict[str, Any] = {
             "chat": self._rpc_chat,
             "status": self._rpc_status,
             "thoughts": self._rpc_thoughts,
             "goals.list": self._rpc_goals_list,
             "goals.add": self._rpc_goals_add,
+            "goals.update": self._rpc_goals_update,
+            "goals.update_status": self._rpc_goals_update_status,
+            "memory.recent": self._rpc_memory_recent,
+            "memory.profile": self._rpc_memory_profile,
+            "memory.get": self._rpc_memory_get,
+            "memory.timeline": self._rpc_memory_timeline,
+            "memory.recall": self._rpc_memory_recall,
+            "memory.hybrid": self._rpc_memory_hybrid,
+            "memory.graph": self._rpc_memory_graph,
+            "memory.clear": self._rpc_memory_clear,
+            "memory.explain_fact": self._rpc_memory_explain_fact,
+            "memory.causal_trace": self._rpc_memory_causal_trace,
+            "debug.db_snapshot": self._rpc_debug_db_snapshot,
+            "debug.clear_all": self._rpc_debug_clear_all,
+            "scenario.run": self._rpc_scenario_run,
+            "report.run": self._rpc_report_run,
+            "timeline.recent": self._rpc_timeline_recent,
+            "autonomy.set_level": self._rpc_autonomy_set_level,
             "improve.analyze": self._rpc_improve_analyze,
             "improve.start": self._rpc_improve_start,
             "improve.status": self._rpc_improve_status,
@@ -468,6 +498,7 @@ class DaemonIPCServer:
             "approve": self._rpc_approve,
             "deny": self._rpc_deny,
             "pending": self._rpc_pending,
+            "pending.clear": self._rpc_pending_clear,
             "inbox.mark_read": self._rpc_inbox_mark_read,
             "browse": self._rpc_browse,
             "memory.search": self._rpc_memory_search,
@@ -494,6 +525,7 @@ class DaemonIPCServer:
             self._socket_path.unlink()
 
         self._running = True
+        self._task_group = task_group
         task_group.start_soon(self._serve)
         logger.info("IPC server starting on %s", self._socket_path)
 
@@ -519,14 +551,20 @@ class DaemonIPCServer:
                     except anyio.ClosedResourceError:
                         break
 
-                    # Handle connection and close it
-                    try:
-                        await self._handle_connection(conn)
-                    finally:
-                        await conn.aclose()
+                    if self._task_group is not None:
+                        self._task_group.start_soon(self._handle_connection_and_close, conn)
+                    else:
+                        await self._handle_connection_and_close(conn)
         except Exception:
             if self._running:
                 logger.exception("IPC server error.")
+
+    async def _handle_connection_and_close(self, conn: anyio.abc.ByteStream) -> None:
+        """Handle one client connection without blocking new accepts."""
+        try:
+            await self._handle_connection(conn)
+        finally:
+            await conn.aclose()
 
     async def _handle_connection(self, stream: anyio.abc.ByteStream) -> None:
         """Read one JSON-RPC request, dispatch, and send response."""
@@ -630,10 +668,907 @@ class DaemonIPCServer:
             return {"ok": False, "error": "no active session to abort"}
         return await self._improver.abort()
 
+    @staticmethod
+    def _memory_preview(doc: dict[str, Any], limit: int = 220) -> str:
+        context = str(doc.get("context", "")).strip()
+        action = str(doc.get("action", "")).strip()
+        outcome = str(doc.get("outcome", "")).strip()
+        joined = " — ".join(part for part in (context, action, outcome) if part)
+        if len(joined) <= limit:
+            return joined
+        return joined[: max(0, limit - 1)].rstrip() + "…"
+
+    @classmethod
+    def _serialize_memory_index(
+        cls,
+        doc: dict[str, Any],
+        *,
+        score: float | None = None,
+        source: str = "episodic",
+    ) -> dict[str, Any]:
+        tags = [str(tag) for tag in doc.get("tags", [])]
+        memory_id = str(doc.get("id", ""))
+        return {
+            "id": memory_id,
+            "preview": cls._memory_preview(doc),
+            "content": cls._memory_preview(doc),
+            "score": score,
+            "source": source,
+            "timestamp": str(doc.get("timestamp", "")),
+            "importance": float(doc.get("importance", 0.0) or 0.0),
+            "tags": tags,
+            "session_id": str(doc.get("session_id", "")),
+            "scope_type": str(doc.get("scope_type", "personal")),
+            "scope_id": str(doc.get("scope_id", "")),
+            "workspace_path": str(doc.get("workspace_path", "")),
+            "repo_name": str(doc.get("repo_name", "")),
+            "citation": f"[memory:{memory_id}]" if memory_id else "",
+            "caused_by": str(doc.get("caused_by", "")) or None,
+            "led_to": [str(item) for item in doc.get("led_to", [])],
+            "source_episode_ids": [str(item) for item in doc.get("source_episode_ids", [])],
+            "summary_kind": str(doc.get("summary_kind", "")),
+            "summary_of_count": int(doc.get("summary_of_count", 0) or 0),
+        }
+
+    @classmethod
+    def _serialize_memory_detail(
+        cls,
+        doc: dict[str, Any],
+        *,
+        score: float | None = None,
+        source: str = "episodic",
+    ) -> dict[str, Any]:
+        item = cls._serialize_memory_index(doc, score=score, source=source)
+        item.update(
+            {
+                "context": str(doc.get("context", "")),
+                "action": str(doc.get("action", "")),
+                "outcome": str(doc.get("outcome", "")),
+                "access_count": int(doc.get("access_count", 0) or 0),
+                "last_accessed": str(doc.get("last_accessed", "")),
+            }
+        )
+        return item
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> datetime:
+        cleaned = value.strip()
+        if cleaned.endswith("Z"):
+            cleaned = cleaned[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(cleaned)
+        except ValueError:
+            return datetime.min.replace(tzinfo=UTC)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+
+    async def _load_memory_docs(self, limit: int = 200) -> list[dict[str, Any]]:
+        docs = await self._brain.memory.episodic._document_store.query(
+            filters={},
+            limit=max(1, min(limit, 1_000)),
+        )
+        docs.sort(key=lambda item: str(item.get("timestamp", "")), reverse=True)
+        return docs
+
+    def _workspace_scope(self) -> dict[str, str]:
+        """Return the daemon's current workspace scope metadata."""
+        workspace = self._get_workspace()
+        root = workspace.root
+        return {
+            "scope_type": "workspace",
+            "scope_id": root.name,
+            "workspace_path": str(root),
+            "repo_name": root.name,
+        }
+
+    def _normalize_scope(
+        self,
+        scope: str = "all",
+        scope_id: str | None = None,
+    ) -> dict[str, str | None]:
+        """Normalize public scope selectors into explicit metadata."""
+        normalized = scope.strip().lower() or "all"
+        if normalized == "workspace":
+            metadata = self._workspace_scope()
+            if scope_id:
+                metadata["scope_id"] = scope_id
+            return metadata
+        if normalized == "personal":
+            return {
+                "scope_type": "personal",
+                "scope_id": scope_id or "personal",
+                "workspace_path": None,
+                "repo_name": None,
+            }
+        return {
+            "scope_type": "all",
+            "scope_id": scope_id,
+            "workspace_path": None,
+            "repo_name": None,
+        }
+
+    @staticmethod
+    def _matches_scope(doc: dict[str, Any], scope_type: str, scope_id: str | None) -> bool:
+        """Return True if a serialized memory doc belongs to the requested scope."""
+        if scope_type == "all":
+            return True
+        if str(doc.get("scope_type", "personal")) != scope_type:
+            return False
+        if scope_id is None:
+            return True
+        return str(doc.get("scope_id", "")) == scope_id
+
+    @staticmethod
+    def _fact_payloads_with_citations(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Decorate fact payloads with citation strings."""
+        enriched: list[dict[str, Any]] = []
+        for fact in facts:
+            source_ids = [str(item) for item in fact.get("source_ids", [])]
+            enriched.append(
+                {
+                    **fact,
+                    "citations": [f"[memory:{source_id}]" for source_id in source_ids if source_id],
+                }
+            )
+        return enriched
+
+    @staticmethod
+    def _semantic_fact_text(doc: dict[str, Any]) -> str:
+        subject = doc.get("subject", {})
+        subject_name = subject.get("name", "") if isinstance(subject, dict) else ""
+        object_value = doc.get("object", "")
+        if isinstance(object_value, dict):
+            object_name = object_value.get("name", "")
+        else:
+            object_name = str(object_value)
+        return f"{subject_name} {doc.get('predicate', '')} {object_name}".strip()
+
+    async def _semantic_evidence_chain(
+        self,
+        source_episode_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        evidence_chain: list[dict[str, Any]] = []
+        for source_episode_id in source_episode_ids:
+            try:
+                raw_doc = await self._brain.memory.episodic._document_store.get(
+                    UUID(source_episode_id)
+                )
+            except Exception:
+                raw_doc = None
+            if raw_doc is None:
+                continue
+            item = self._serialize_memory_detail(raw_doc, source="episodic")
+            item["episode_id"] = item["id"]
+            evidence_chain.append(item)
+        evidence_chain.sort(key=lambda item: str(item.get("timestamp", "")))
+        return evidence_chain
+
+    async def _rpc_memory_profile(self) -> dict[str, Any]:
+        """Return a lightweight profile + recent context for the daemon user."""
+        try:
+            identity = JarvisIdentity(DaemonConfig().state_path)
+            recent_docs = await self._load_memory_docs(limit=120)
+            profile_model = self._build_master_profile(identity, recent_docs)
+            identity.write_master_profile(profile_model)
+            profile = identity.read_master_profile()
+            tag_counts = Counter(
+                tag
+                for doc in recent_docs
+                for tag in doc.get("tags", [])
+                if isinstance(tag, str) and tag.strip()
+            )
+            active_goals = [
+                goal.description for goal in self._brain.control.goals.get_active_goals()[:5]
+            ]
+            recent_memories = [self._serialize_memory_index(doc) for doc in recent_docs[:5]]
+            dynamic = list(
+                dict.fromkeys(
+                    [
+                        *[str(item) for item in profile.get("dynamic", [])],
+                        *active_goals,
+                    ]
+                )
+            )
+            return {
+                "static": profile.get("static", []),
+                "dynamic": dynamic,
+                "questions": profile.get("questions", []),
+                "static_facts": self._fact_payloads_with_citations(profile.get("static_facts", [])),
+                "dynamic_facts": self._fact_payloads_with_citations(
+                    profile.get("dynamic_facts", [])
+                ),
+                "question_facts": self._fact_payloads_with_citations(
+                    profile.get("question_facts", [])
+                ),
+                "top_tags": [
+                    {"tag": tag, "count": count} for tag, count in tag_counts.most_common(5)
+                ],
+                "recent_memories": recent_memories,
+                "recent_changes": self._fact_payloads_with_citations(
+                    self._recent_profile_changes(profile_model)
+                ),
+                "active_scope": self._workspace_scope(),
+                "raw_markdown": profile.get("raw_markdown", ""),
+            }
+        except Exception as exc:
+            logger.warning("memory.profile failed: %s", exc)
+            return {
+                "static": [],
+                "dynamic": [],
+                "questions": [],
+                "static_facts": [],
+                "dynamic_facts": [],
+                "question_facts": [],
+                "top_tags": [],
+                "recent_memories": [],
+                "recent_changes": [],
+                "active_scope": self._workspace_scope(),
+                "error": str(exc),
+            }
+
+    def _build_master_profile(
+        self,
+        identity: JarvisIdentity,
+        docs: list[dict[str, Any]],
+    ) -> MasterProfile:
+        """Build a structured profile from captured episodic docs + existing questions."""
+        existing = identity.read_master_profile_model()
+        facts: list[ProfileFact] = []
+
+        for doc in docs:
+            tags = {str(tag) for tag in doc.get("tags", [])}
+            source_id = str(doc.get("id", ""))
+            timestamp = str(doc.get("timestamp", ""))
+            context = str(doc.get("context", "")).strip()
+            if not context:
+                continue
+
+            if "profile_static" in tags:
+                section = self._static_section_for_text(context)
+                facts.append(
+                    ProfileFact(
+                        text=context,
+                        section=section,
+                        source_ids=[source_id] if source_id else [],
+                        updated_at=timestamp,
+                    )
+                )
+
+            if "profile_dynamic" in tags or "project_context" in tags:
+                facts.append(
+                    ProfileFact(
+                        text=context,
+                        section="What They're Working On",
+                        source_ids=[source_id] if source_id else [],
+                        updated_at=timestamp,
+                    )
+                )
+
+        for goal in self._active_goal_descriptions():
+            facts.append(
+                ProfileFact(
+                    text=goal,
+                    section="What They're Working On",
+                    source_ids=[],
+                    updated_at="",
+                )
+            )
+
+        preserved_facts = [
+            fact
+            for fact in existing.facts
+            if fact.section == "Questions I Want to Ask Them" or not fact.source_ids
+        ]
+
+        profile = MasterProfile(facts=[])
+        for fact in [*preserved_facts, *facts]:
+            profile = JarvisIdentity._merge_fact(profile, fact)
+        return profile
+
+    @staticmethod
+    def _static_section_for_text(text: str) -> str:
+        """Route a stable profile fact to a human-readable section."""
+        lowered = text.lower()
+        if any(marker in lowered for marker in ("prefer", "like", "love", "favorite")):
+            return "What Drives Them"
+        return "Who Is My Master"
+
+    @staticmethod
+    def _recent_profile_changes(profile: MasterProfile) -> list[dict[str, Any]]:
+        """Return a small latest-first list of recently updated profile facts."""
+        with_timestamps = [fact for fact in profile.facts if fact.updated_at]
+        with_timestamps.sort(key=lambda fact: fact.updated_at, reverse=True)
+        return [fact.model_dump(mode="json") for fact in with_timestamps[:5]]
+
+    async def _rpc_memory_recall(
+        self,
+        query: str = "",
+        top_k: int = 10,
+        scope: str = "all",
+        scope_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return profile + relevant memories together in one call."""
+        return await self._rpc_memory_search(
+            query=query,
+            top_k=top_k,
+            scope=scope,
+            scope_id=scope_id,
+        )
+
+    async def _rpc_memory_hybrid(
+        self,
+        query: str = "",
+        top_k: int = 10,
+        scope: str = "all",
+        scope_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return profile + memories + goals + workspace snippets together."""
+        if not query.strip():
+            return {"query": "", "hybrid_results": []}
+
+        normalized_scope = self._normalize_scope(scope, scope_id)
+        memory_result = await self._rpc_memory_search(
+            query=query,
+            top_k=top_k,
+            scope=scope,
+            scope_id=scope_id,
+        )
+        if memory_result.get("error"):
+            return memory_result
+
+        goals = [
+            {
+                "id": str(goal.id),
+                "description": goal.description,
+                "priority": goal.priority,
+                "status": str(goal.status),
+            }
+            for goal in self._brain.control.goals.get_active_goals()[:5]
+        ]
+
+        workspace_items: list[dict[str, Any]] = []
+        try:
+            workspace_listing = await self._rpc_workspace_list(".")
+            workspace_items = workspace_listing.get("entries", [])[:10]
+        except Exception:
+            logger.debug("memory.hybrid workspace listing failed", exc_info=True)
+
+        hybrid_items: list[dict[str, Any]] = []
+        for item in memory_result.get("results", []):
+            hybrid_items.append(
+                {
+                    "kind": "memory",
+                    "score": float(item.get("score", 0.0) or 0.0),
+                    "title": str(item.get("preview", "")),
+                    "payload": item,
+                }
+            )
+        for goal in goals:
+            score = 0.75 if query.lower() in goal["description"].lower() else 0.45
+            hybrid_items.append(
+                {
+                    "kind": "goal",
+                    "score": score,
+                    "title": goal["description"],
+                    "payload": goal,
+                }
+            )
+        for item in workspace_items:
+            label = str(item.get("path") or item.get("name") or "")
+            score = 0.7 if query.lower() in label.lower() else 0.4
+            hybrid_items.append(
+                {
+                    "kind": "workspace",
+                    "score": score,
+                    "title": label,
+                    "payload": item,
+                }
+            )
+
+        hybrid_items.sort(key=lambda item: float(item["score"]), reverse=True)
+
+        return {
+            "query": query,
+            "scope": normalized_scope["scope_type"],
+            "scope_id": normalized_scope["scope_id"],
+            "profile": memory_result.get("profile", {}),
+            "memory_results": memory_result.get("results", []),
+            "goal_results": goals,
+            "workspace_results": workspace_items,
+            "hybrid_results": hybrid_items[: max(top_k * 3, 10)],
+        }
+
+    async def _rpc_memory_graph(
+        self,
+        limit: int = 40,
+        scope: str = "all",
+        scope_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a lightweight graph of memory storage and relationships."""
+        normalized_scope = self._normalize_scope(scope, scope_id)
+        docs = await self._load_memory_docs(limit=max(1, min(limit, 120)))
+        docs = [
+            doc
+            for doc in docs
+            if self._matches_scope(
+                doc,
+                str(normalized_scope["scope_type"]),
+                normalized_scope["scope_id"],
+            )
+        ]
+
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        seen_nodes: set[str] = set()
+
+        def add_node(node: dict[str, Any]) -> None:
+            node_id = str(node["id"])
+            if node_id in seen_nodes:
+                return
+            seen_nodes.add(node_id)
+            nodes.append(node)
+
+        for doc in docs:
+            memory_id = str(doc.get("id", "")).strip()
+            if not memory_id:
+                continue
+            scope_label = (
+                str(doc.get("repo_name", "")).strip()
+                or str(doc.get("scope_id", "")).strip()
+                or "personal"
+            )
+            scope_node_id = f"scope:{doc.get('scope_type', 'personal')}:{scope_label}"
+            add_node(
+                {
+                    "id": scope_node_id,
+                    "label": scope_label,
+                    "kind": "scope",
+                    "memory_type": "scope",
+                    "scope_type": str(doc.get("scope_type", "personal")),
+                }
+            )
+
+            node_kind = "summary" if int(doc.get("summary_of_count", 0) or 0) > 0 else "memory"
+            add_node(
+                {
+                    "id": f"memory:{memory_id}",
+                    "memory_id": memory_id,
+                    "label": self._memory_preview(doc, limit=44),
+                    "kind": node_kind,
+                    "memory_type": "episodic",
+                    "importance": float(doc.get("importance", 0.0) or 0.0),
+                    "summary_of_count": int(doc.get("summary_of_count", 0) or 0),
+                    "lifecycle_state": str(doc.get("lifecycle_state", "durable")),
+                    "emotional_valence": float(doc.get("emotional_valence", 0.0) or 0.0),
+                    "scope_type": str(doc.get("scope_type", "personal")),
+                    "scope_id": str(doc.get("scope_id", "")),
+                    "citation": f"[memory:{memory_id}]",
+                }
+            )
+            edges.append(
+                {
+                    "id": f"edge:scope:{memory_id}",
+                    "source": f"memory:{memory_id}",
+                    "target": scope_node_id,
+                    "kind": "stored_in",
+                }
+            )
+
+            for source_episode_id in doc.get("source_episode_ids", []):
+                source_id = str(source_episode_id).strip()
+                if not source_id:
+                    continue
+                source_doc = next(
+                    (candidate for candidate in docs if str(candidate.get("id", "")) == source_id),
+                    None,
+                )
+                if source_doc is not None:
+                    add_node(
+                        {
+                            "id": f"memory:{source_id}",
+                            "memory_id": source_id,
+                            "label": self._memory_preview(source_doc, limit=44),
+                            "kind": "memory",
+                            "memory_type": "episodic",
+                            "importance": float(source_doc.get("importance", 0.0) or 0.0),
+                            "summary_of_count": int(source_doc.get("summary_of_count", 0) or 0),
+                            "lifecycle_state": str(source_doc.get("lifecycle_state", "durable")),
+                            "scope_type": str(source_doc.get("scope_type", "personal")),
+                            "scope_id": str(source_doc.get("scope_id", "")),
+                            "citation": f"[memory:{source_id}]",
+                        }
+                    )
+                edges.append(
+                    {
+                        "id": f"edge:summary:{memory_id}:{source_id}",
+                        "source": f"memory:{memory_id}",
+                        "target": f"memory:{source_id}",
+                        "kind": "summarizes",
+                    }
+                )
+
+            caused_by_id = str(doc.get("caused_by", "")).strip()
+            if caused_by_id and caused_by_id.lower() != "none":
+                edges.append(
+                    {
+                        "id": f"edge:caused_by:{memory_id}:{caused_by_id}",
+                        "source": f"memory:{memory_id}",
+                        "target": f"memory:{caused_by_id}",
+                        "kind": "caused_by",
+                    }
+                )
+
+            for led_to_id in doc.get("led_to", []):
+                target_id = str(led_to_id).strip()
+                if not target_id or target_id.lower() == "none":
+                    continue
+                edges.append(
+                    {
+                        "id": f"edge:led_to:{memory_id}:{target_id}",
+                        "source": f"memory:{memory_id}",
+                        "target": f"memory:{target_id}",
+                        "kind": "led_to",
+                    }
+                )
+
+        # --- Semantic triples (knowledge graph facts) ---
+        try:
+            triple_docs = await self._brain.memory.semantic._docs.query(
+                filters={"_type": "triple"}, limit=min(limit, 60)
+            )
+            for tdoc in triple_docs:
+                tid = str(tdoc.get("id", "")).strip()
+                if not tid:
+                    continue
+                subj_raw = tdoc.get("subject", {})
+                subj = tdoc.get("subject_name", "") or (
+                    subj_raw.get("name", "") if isinstance(subj_raw, dict) else ""
+                )
+                pred = str(tdoc.get("predicate", ""))
+                obj_raw_val = tdoc.get("object", {})
+                obj_raw = tdoc.get("object_name", "") or (
+                    obj_raw_val.get("name", "")
+                    if isinstance(obj_raw_val, dict)
+                    else str(obj_raw_val)
+                )
+                label = f"{subj} {pred} {obj_raw}".strip()[:44] or "semantic fact"
+                add_node(
+                    {
+                        "id": f"semantic:{tid}",
+                        "label": label,
+                        "kind": "semantic",
+                        "memory_type": "semantic",
+                        "confidence": float(tdoc.get("confidence", 0.5) or 0.5),
+                        "predicate": pred,
+                    }
+                )
+                for ep_id in (tdoc.get("source_episodes") or []):
+                    src = str(ep_id).strip()
+                    if src:
+                        edges.append(
+                            {
+                                "id": f"edge:sem_src:{tid}:{src}",
+                                "source": f"semantic:{tid}",
+                                "target": f"memory:{src}",
+                                "kind": "extracted_from",
+                            }
+                        )
+        except Exception:
+            pass
+
+        return {
+            "scope": normalized_scope["scope_type"],
+            "scope_id": normalized_scope["scope_id"],
+            "nodes": nodes,
+            "edges": edges,
+        }
+
+    async def _rpc_memory_clear(self, confirm: bool = False) -> dict[str, Any]:
+        """Clear all episodic memories and reset vector index. Requires confirm=True."""
+        if not confirm:
+            return {"error": "Pass confirm=true to clear all memories. This is irreversible."}
+        try:
+            await self._clear_document_store(self._brain.memory.episodic._document_store)
+            await self._brain.memory.episodic._vector_store.clear()
+            return {"ok": True, "message": "Episodic memory cleared."}
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    async def _clear_document_store(self, store: Any) -> int:
+        before = await store.count()
+        clear = getattr(store, "clear", None)
+        if callable(clear):
+            result = clear()
+            if hasattr(result, "__await__"):
+                await result
+            return int(before)
+        docs = await store.query(filters={}, limit=1_000_000)
+        for doc in docs:
+            raw_id = str(doc.get("id", "")).strip()
+            if raw_id:
+                with suppress(ValueError):
+                    await store.delete(UUID(raw_id))
+        return int(before)
+
+    async def _clear_vector_store(self, store: Any) -> int:
+        before = await store.count()
+        clear = getattr(store, "clear", None)
+        if callable(clear):
+            result = clear()
+            if hasattr(result, "__await__"):
+                await result
+        return int(before)
+
+    async def _rpc_debug_db_snapshot(self, limit: int = 5) -> dict[str, Any]:
+        """Return transparent counts and sample records across daemon stores."""
+        stores = {
+            "episodic": self._brain.memory.episodic._document_store,
+            "semantic": self._brain.memory.semantic._docs,
+            "procedural": self._brain.memory.procedural._docs,
+        }
+        snapshot: dict[str, Any] = {}
+        for name, store in stores.items():
+            docs = await store.query(filters={}, limit=max(1, min(limit, 25)))
+            snapshot[name] = {"count": await store.count(), "sample": docs}
+
+        snapshot["runtime"] = {
+            "thoughts": len(self._state.recent_thoughts),
+            "proactive_inbox": len(self._state.proactive_inbox),
+            "pending_approvals": len(self._autonomy.get_pending()),
+            "chat_history": len(self._chat_history),
+            "active_goals": len(self._brain.control.goals.get_active_goals()),
+        }
+        return snapshot
+
+    async def _rpc_debug_clear_all(self, confirm: bool = False) -> dict[str, Any]:
+        """Clear all DBs, thoughts, pending queues, goals, and Jarvis files."""
+        if not confirm:
+            return {"error": "Pass confirm=true to clear all daemon memory and state."}
+
+        cleared = {
+            "episodic_documents": await self._clear_document_store(
+                self._brain.memory.episodic._document_store
+            ),
+            "semantic_documents": await self._clear_document_store(
+                self._brain.memory.semantic._docs
+            ),
+            "procedural_documents": await self._clear_document_store(
+                self._brain.memory.procedural._docs
+            ),
+            "episodic_vectors": await self._clear_vector_store(
+                self._brain.memory.episodic._vector_store
+            ),
+            "semantic_vectors": await self._clear_vector_store(
+                self._brain.memory.semantic._vectors
+            ),
+            "procedural_vectors": await self._clear_vector_store(
+                self._brain.memory.procedural._vectors
+            ),
+        }
+
+        graph = getattr(self._brain.memory.semantic, "_graph", None)
+        if graph is not None and hasattr(graph, "_graph"):
+            with suppress(Exception):
+                import igraph
+
+                graph._graph = igraph.Graph(directed=True)
+                graph._uuid_to_vtx = {}
+                graph_path = getattr(graph, "_graph_path", "")
+                if graph_path:
+                    Path(graph_path).unlink(missing_ok=True)
+
+        self._state.recent_thoughts = []
+        self._state.proactive_inbox = []
+        self._state.pending_approvals = []
+        self._state.pending_curiosity_question = None
+        self._state.daemon_started_at = datetime.now(UTC)
+        self._state.total_cycles = 0
+        self._state.total_idle_ticks = 0
+        self._state.last_user_interaction = None
+        self._state.last_consolidation = None
+        self._state.observer_stats = {}
+        self._chat_history.clear()
+        self._pending_tool_actions.clear()
+        self._autonomy.clear_pending()
+
+        from mnemon.daemon.identity import _LEARNINGS_INIT, _MASTER_INIT, _SOUL_INIT
+
+        state_path = DaemonConfig().state_path
+        state_path.mkdir(parents=True, exist_ok=True)
+        (state_path / "soul.md").write_text(_SOUL_INIT, encoding="utf-8")
+        (state_path / "master.md").write_text(_MASTER_INIT, encoding="utf-8")
+        (state_path / "learnings.md").write_text(_LEARNINGS_INIT, encoding="utf-8")
+        (state_path / "master_profile.json").unlink(missing_ok=True)
+        (state_path / "goals.json").write_text("[]\n", encoding="utf-8")
+
+        goals = getattr(self._brain.control.goals, "_goals", None)
+        if isinstance(goals, dict):
+            cleared["goals"] = len(goals)
+            goals.clear()
+
+        with suppress(Exception):
+            from mnemon.daemon.state import save_state
+
+            save_state(self._state, state_path)
+
+        logger.warning("Cleared all daemon DBs and runtime state for testing.")
+        return {"ok": True, "cleared": cleared}
+
+    async def _rpc_memory_explain_fact(self, triple_id: str = "") -> dict[str, Any]:
+        """Return a semantic fact plus the episodic evidence chain behind it."""
+        if not triple_id:
+            return {"error": "triple_id is required"}
+
+        try:
+            triple_uuid = UUID(triple_id)
+        except ValueError as exc:
+            return {"error": f"invalid triple_id: {exc}"}
+
+        raw_doc = await self._brain.memory.semantic._docs.get(triple_uuid)
+        if raw_doc is None or raw_doc.get("_type") != "triple":
+            return {"error": f"semantic fact not found: {triple_id}"}
+
+        source_episode_ids = [str(item) for item in raw_doc.get("source_episodes", [])]
+        evidence_chain = await self._semantic_evidence_chain(source_episode_ids)
+        contradiction_group = str(raw_doc.get("contradiction_group", "")).strip()
+        related_facts: list[dict[str, Any]] = []
+
+        if contradiction_group:
+            triple_docs = await self._brain.memory.semantic._docs.query(
+                filters={"_type": "triple"},
+                limit=10_000,
+            )
+            related_facts = [
+                {
+                    "triple_id": str(doc.get("id", "")),
+                    "fact": self._semantic_fact_text(doc),
+                    "confidence": float(doc.get("confidence", 0.0) or 0.0),
+                    "current": bool(doc.get("current", False)),
+                    "last_confirmed": str(doc.get("last_confirmed", "")),
+                }
+                for doc in triple_docs
+                if doc.get("contradiction_group") == contradiction_group
+                and str(doc.get("id", "")) != triple_id
+            ]
+
+        return {
+            "triple_id": triple_id,
+            "fact": self._semantic_fact_text(raw_doc),
+            "confidence": float(raw_doc.get("confidence", 0.0) or 0.0),
+            "current": bool(raw_doc.get("current", False)),
+            "last_confirmed": str(raw_doc.get("last_confirmed", "")),
+            "source_episode_ids": source_episode_ids,
+            "evidence_count": len(evidence_chain),
+            "evidence_chain": evidence_chain,
+            "related_facts": related_facts,
+        }
+
+    async def _rpc_memory_causal_trace(
+        self,
+        episode_id: str | None = None,
+        outcome_query: str | None = None,
+        max_depth: int = 10,
+    ) -> dict[str, Any]:
+        """Trace the causal chain behind an episode or outcome query."""
+
+        async def _get_episode_doc(raw_id: str) -> dict[str, Any] | None:
+            try:
+                return await self._brain.memory.episodic._document_store.get(UUID(raw_id))
+            except ValueError:
+                docs = await self._brain.memory.episodic._document_store.query(
+                    filters={}, limit=10_000
+                )
+                return next((doc for doc in docs if str(doc.get("id", "")) == raw_id), None)
+
+        target_doc: dict[str, Any] | None = None
+
+        if episode_id:
+            target_doc = await _get_episode_doc(episode_id)
+        elif outcome_query and outcome_query.strip():
+            search_result = await self._rpc_memory_search(query=outcome_query, top_k=1)
+            if search_result.get("results"):
+                result_id = str(search_result["results"][0].get("id", ""))
+                if result_id:
+                    target_doc = await _get_episode_doc(result_id)
+        else:
+            return {"error": "episode_id or outcome_query is required"}
+
+        if target_doc is None:
+            return {"error": "causal target episode not found"}
+
+        chain: list[dict[str, Any]] = []
+        visited: set[str] = set()
+        current_doc = target_doc
+        depth = 0
+        while current_doc is not None and depth < max_depth:
+            current_id = str(current_doc.get("id", ""))
+            if current_id in visited:
+                break
+            visited.add(current_id)
+            chain.append(self._serialize_memory_detail(current_doc))
+            caused_by = str(current_doc.get("caused_by", "")).strip()
+            if not caused_by:
+                break
+            current_doc = await _get_episode_doc(caused_by)
+            depth += 1
+
+        chain.reverse()
+        target_id = str(target_doc.get("id", ""))
+        return {
+            "target_episode_id": target_id,
+            "outcome_query": outcome_query,
+            "chain_length": len(chain),
+            "chain": chain,
+            "citations": [f"[memory:{item['id']}]" for item in chain if item.get("id")],
+        }
+
+    async def _rpc_scenario_run(
+        self,
+        scenario: str = "",
+        scope: str = "all",
+        scope_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate a bounded scenario report grounded in current memory/goals/workspace."""
+        if not scenario.strip():
+            return {"error": "scenario is required"}
+
+        hybrid = await self._rpc_memory_hybrid(
+            query=scenario,
+            top_k=6,
+            scope=scope,
+            scope_id=scope_id,
+        )
+        if hybrid.get("error"):
+            return hybrid
+
+        engine = self._get_scenario_engine()
+        return await engine.run(
+            scenario=scenario,
+            profile=hybrid.get("profile", {}),
+            goals=hybrid.get("goal_results", []),
+            memories=hybrid.get("memory_results", []),
+            workspace_items=hybrid.get("workspace_results", []),
+        )
+
+    async def _rpc_report_run(
+        self,
+        report_type: str = "weekly",
+        focus: str = "",
+        scope: str = "all",
+        scope_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate a bounded weekly/project report grounded in current context."""
+        normalized_type = report_type.strip().lower() or "weekly"
+        if normalized_type not in {"weekly", "project"}:
+            return {"error": "report_type must be 'weekly' or 'project'"}
+
+        query = focus or normalized_type
+        hybrid = await self._rpc_memory_hybrid(
+            query=query,
+            top_k=6,
+            scope=scope,
+            scope_id=scope_id,
+        )
+        if hybrid.get("error"):
+            return hybrid
+
+        engine = self._get_report_engine()
+        return await engine.run(
+            report_type=normalized_type,
+            focus=focus,
+            profile=hybrid.get("profile", {}),
+            goals=hybrid.get("goal_results", []),
+            memories=hybrid.get("memory_results", []),
+            workspace_items=hybrid.get("workspace_results", []),
+        )
+
     async def _rpc_memory_search(
         self,
         query: str = "",
         top_k: int = 10,
+        scope: str = "all",
+        scope_id: str | None = None,
     ) -> dict[str, Any]:
         if not query.strip():
             return {"query": "", "results": []}
@@ -641,24 +1576,238 @@ class DaemonIPCServer:
         try:
             from mnemon.core.models import RetrievalQuery
 
+            normalized_scope = self._normalize_scope(scope, scope_id)
+            filters: dict[str, Any] = {}
+            if normalized_scope["scope_type"] != "all":
+                filters = {
+                    "scope_type": normalized_scope["scope_type"],
+                    "scope_id": normalized_scope["scope_id"],
+                }
             retrieval = await self._brain.memory.episodic.retrieve(
-                RetrievalQuery(query_text=query, top_k=max(1, top_k))
+                RetrievalQuery(
+                    query_text=query,
+                    top_k=max(1, top_k),
+                    filters=filters,
+                )
             )
+            results: list[dict[str, Any]] = []
+            for item in retrieval.items:
+                episode_id = str(item.metadata.get("episode_id", "")).strip()
+                raw_doc: dict[str, Any] | None = None
+                if episode_id:
+                    with suppress(Exception):
+                        raw_doc = await self._brain.memory.episodic._document_store.get(
+                            UUID(episode_id)
+                        )
+                doc = raw_doc or {
+                    "id": episode_id,
+                    "context": item.content,
+                    "timestamp": item.metadata.get("timestamp", ""),
+                    "importance": item.metadata.get("importance", 0.0),
+                    "tags": item.metadata.get("tags", []),
+                    "session_id": item.metadata.get("session_id", ""),
+                }
+                results.append(
+                    self._serialize_memory_index(
+                        doc,
+                        score=float(item.score),
+                        source=str(item.source_store),
+                    )
+                )
             return {
                 "query": query,
-                "results": [
-                    {
-                        "content": item.content,
-                        "score": item.score,
-                        "source": item.source_store,
-                        "metadata": item.metadata,
-                    }
-                    for item in retrieval.items
-                ],
+                "scope": normalized_scope["scope_type"],
+                "scope_id": normalized_scope["scope_id"],
+                "profile": await self._rpc_memory_profile(),
+                "results": sorted(
+                    results,
+                    key=lambda item: (
+                        int((item.get("summary_of_count", 0) or 0) > 0),
+                        float(item.get("score", 0.0) or 0.0),
+                    ),
+                    reverse=True,
+                ),
             }
         except Exception as exc:
             logger.warning("memory.search failed: %s", exc)
             return {"query": query, "results": [], "error": str(exc)}
+
+    async def _rpc_memory_get(self, ids: list[str] | None = None) -> dict[str, Any]:
+        """Fetch full episodic memory records by id."""
+        if not ids:
+            return {"items": [], "missing": []}
+
+        items: list[dict[str, Any]] = []
+        missing: list[str] = []
+
+        for raw_id in ids[:50]:
+            try:
+                episode_id = UUID(str(raw_id))
+            except ValueError:
+                missing.append(str(raw_id))
+                continue
+
+            doc = await self._brain.memory.episodic._document_store.get(episode_id)
+            if doc is None:
+                missing.append(str(raw_id))
+                continue
+            items.append(self._serialize_memory_detail(doc))
+
+        return {"items": items, "missing": missing}
+
+    async def _rpc_memory_recent(self, limit: int = 20) -> dict[str, Any]:
+        """Return recent episodic memory entries for browsing."""
+        try:
+            docs = await self._load_memory_docs(limit=max(1, min(limit * 5, 500)))
+            items = [self._serialize_memory_detail(doc) for doc in docs[: max(1, min(limit, 100))]]
+            return {"items": items}
+        except Exception as exc:
+            logger.warning("memory.recent failed: %s", exc)
+            return {"items": [], "error": str(exc)}
+
+    async def _rpc_memory_timeline(
+        self,
+        anchor_id: str = "",
+        limit: int = 6,
+    ) -> dict[str, Any]:
+        """Return memories surrounding an anchor event."""
+        if not anchor_id.strip():
+            return {"anchor_id": "", "items": []}
+
+        try:
+            anchor_uuid = UUID(anchor_id)
+        except ValueError:
+            return {"anchor_id": anchor_id, "items": [], "error": "invalid anchor id"}
+
+        anchor_doc = await self._brain.memory.episodic._document_store.get(anchor_uuid)
+        if anchor_doc is None:
+            return {"anchor_id": anchor_id, "items": [], "error": "anchor not found"}
+
+        docs = await self._load_memory_docs(limit=300)
+        anchor_session = str(anchor_doc.get("session_id", ""))
+        if anchor_session:
+            scoped_docs = [doc for doc in docs if str(doc.get("session_id", "")) == anchor_session]
+            if len(scoped_docs) >= 2:
+                docs = scoped_docs
+
+        docs.sort(key=lambda doc: self._parse_timestamp(str(doc.get("timestamp", ""))))
+        anchor_index = next(
+            (idx for idx, doc in enumerate(docs) if str(doc.get("id", "")) == anchor_id),
+            None,
+        )
+        if anchor_index is None:
+            docs.append(anchor_doc)
+            docs.sort(key=lambda doc: self._parse_timestamp(str(doc.get("timestamp", ""))))
+            anchor_index = next(
+                idx for idx, doc in enumerate(docs) if str(doc.get("id", "")) == anchor_id
+            )
+
+        total = max(1, min(limit, 20))
+        before = max(0, anchor_index - total // 2)
+        after = min(len(docs), before + total)
+        window = docs[before:after]
+
+        items: list[dict[str, Any]] = []
+        for doc in window:
+            item = self._serialize_memory_index(doc)
+            item["anchor"] = str(doc.get("id", "")) == anchor_id
+            items.append(item)
+
+        return {
+            "anchor_id": anchor_id,
+            "session_id": str(anchor_doc.get("session_id", "")),
+            "items": items,
+        }
+
+    async def _rpc_timeline_recent(self, limit: int = 40) -> dict[str, Any]:
+        """Return a merged timeline of recent daemon activity."""
+        items: list[dict[str, Any]] = []
+
+        for thought in self._state.recent_thoughts[-limit:]:
+            items.append(
+                {
+                    "kind": "thought",
+                    "timestamp": str(thought.timestamp),
+                    "title": thought.activity,
+                    "summary": thought.summary,
+                }
+            )
+
+        for message in self._state.proactive_inbox[-limit:]:
+            items.append(
+                {
+                    "kind": "inbox",
+                    "timestamp": str(message.timestamp),
+                    "title": message.source_activity,
+                    "summary": message.content,
+                    "read": message.read,
+                }
+            )
+
+        for approval in self._autonomy.get_pending():
+            items.append(
+                {
+                    "kind": "approval",
+                    "timestamp": str(approval.proposed_at),
+                    "title": approval.source,
+                    "summary": approval.description,
+                    "risk": str(approval.risk_level),
+                }
+            )
+
+        try:
+            recent_memories = await self._rpc_memory_recent(limit=min(limit, 10))
+            for memory in recent_memories.get("items", []):
+                items.append(
+                    {
+                        "kind": "memory",
+                        "timestamp": memory["timestamp"],
+                        "title": "episodic memory",
+                        "summary": memory["context"][:220],
+                        "importance": memory["importance"],
+                        "memory_id": memory["id"],
+                        "tags": memory.get("tags", []),
+                    }
+                )
+        except Exception:
+            logger.debug("timeline memory merge failed", exc_info=True)
+
+        items.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
+        return {"items": items[: max(1, min(limit, 100))]}
+
+    async def _rpc_autonomy_set_level(self, level: str = "") -> dict[str, Any]:
+        """Set daemon autonomy level."""
+        if not level:
+            return {"error": "level is required"}
+        from mnemon.daemon.config import AutonomyLevel
+
+        try:
+            self._autonomy.level = AutonomyLevel(level)
+        except Exception as exc:
+            return {"error": f"invalid autonomy level: {exc}"}
+        return {"ok": True, "level": str(self._autonomy.level)}
+
+    def _active_goal_descriptions(self) -> list[str]:
+        """Return active goal descriptions for capture/ranking heuristics."""
+        try:
+            goals = self._brain.control.goals.get_active_goals()
+        except Exception:
+            return []
+        return [str(goal.description) for goal in goals]
+
+    def _get_scenario_engine(self) -> ScenarioEngine:
+        """Lazy-create the bounded scenario engine."""
+        if self._scenario_engine is None:
+            llm = self._brain.control.goals._llm
+            self._scenario_engine = ScenarioEngine(llm)
+        return self._scenario_engine
+
+    def _get_report_engine(self) -> ReportEngine:
+        """Lazy-create the bounded report engine."""
+        if self._report_engine is None:
+            llm = self._brain.control.goals._llm
+            self._report_engine = ReportEngine(llm)
+        return self._report_engine
 
     async def _rpc_chat(self, message: str = "") -> dict[str, Any]:
         """User sends a message -> run cognitive cycle -> generate reply -> return."""
@@ -684,6 +1833,22 @@ class DaemonIPCServer:
             __import__("datetime").timezone.utc
         )
         self._state.total_cycles += 1
+        privacy_rules = load_privacy_rules(DaemonConfig().state_path)
+
+        capture_pre = classify_interaction(
+            user_message=message,
+            active_goals=self._active_goal_descriptions(),
+            source="chat",
+            excluded_phrases=privacy_rules.excluded_phrases,
+        )
+        if not capture_pre.store_memory:
+            with suppress(Exception):
+                self._brain.orchestrator.suppress_next_episode_storage()
+        elif privacy_rules.redaction_phrases:
+            with suppress(Exception):
+                self._brain.orchestrator.configure_next_episode_redactions(
+                    privacy_rules.redaction_phrases
+                )
 
         try:
             result = await self._brain.run_cycle(raw_input=message)
@@ -700,16 +1865,46 @@ class DaemonIPCServer:
 
             # Generate reply with full conversation history + retrieved memories
             reply = await self._generate_reply(
-                message, deliberation,
+                message,
+                deliberation,
                 pending_curiosity=pending_q,
                 browse_result=browse_result,
             )
+            citation_ids = [
+                str(item) for item in deliberation.get("citation_ids", []) if str(item).strip()
+            ]
+            if citation_ids and self._wants_citations(message):
+                citation_text = " ".join(f"[memory:{item}]" for item in citation_ids[:5])
+                reply = f"{reply}\n\nSources: {citation_text}"
 
             # Patch the episode outcome with Jarvis's actual reply
-            try:
-                await self._brain.orchestrator.update_last_episode_outcome(reply)
-            except Exception:
-                logger.warning("Could not update episode outcome", exc_info=True)
+            if capture_pre.store_memory:
+                try:
+                    reply = apply_redactions(reply, privacy_rules)
+                    await self._brain.orchestrator.update_last_episode_outcome(reply)
+                    capture_post = classify_interaction(
+                        user_message=message,
+                        assistant_reply=reply,
+                        active_goals=self._active_goal_descriptions(),
+                        source="chat",
+                        excluded_phrases=privacy_rules.excluded_phrases,
+                    )
+                    scope_metadata = self._workspace_scope()
+                    await self._brain.orchestrator.update_last_episode_metadata(
+                        tags=capture_post.tags,
+                        importance=capture_post.importance,
+                        scope_type=scope_metadata["scope_type"],
+                        scope_id=scope_metadata["scope_id"],
+                        workspace_path=scope_metadata["workspace_path"],
+                        repo_name=scope_metadata["repo_name"],
+                    )
+                    if citation_ids:
+                        await self._brain.orchestrator.record_retrieval_feedback(
+                            citation_ids,
+                            helpful=True,
+                        )
+                except Exception:
+                    logger.warning("Could not update episode capture metadata", exc_info=True)
 
             # Update conversation history
             self._chat_history.append({"role": "user", "content": message})
@@ -722,6 +1917,7 @@ class DaemonIPCServer:
                 "meta": result.get("meta_evaluation"),
                 "deliberation": deliberation,
                 "reply": reply,
+                "citations": [f"[memory:{item}]" for item in citation_ids[:5]],
             }
         finally:
             self._idle_loop.resume()
@@ -738,12 +1934,39 @@ class DaemonIPCServer:
         """Detect if the user is asking Jarvis to look something up online."""
         msg = message.lower()
         browse_keywords = (
-            "research", "look up", "find", "search", "browse",
-            "check online", "what is", "who is", "how does", "latest",
-            "news about", "strategy", "script that", "write a script",
-            "can you find", "find me", "get me",
+            "research",
+            "look up",
+            "find",
+            "search",
+            "browse",
+            "check online",
+            "what is",
+            "who is",
+            "how does",
+            "latest",
+            "news about",
+            "strategy",
+            "script that",
+            "write a script",
+            "can you find",
+            "find me",
+            "get me",
         )
         return any(kw in msg for kw in browse_keywords)
+
+    @staticmethod
+    def _wants_citations(message: str) -> bool:
+        """Return True when the user explicitly asks for sourced output."""
+        lowered = message.lower()
+        triggers = (
+            "with citations",
+            "with sources",
+            "cite",
+            "citation",
+            "source ids",
+            "show sources",
+        )
+        return any(trigger in lowered for trigger in triggers)
 
     async def _handle_browse_request(self, message: str) -> str:
         """Run a browse task derived from the user's message."""
@@ -775,7 +1998,7 @@ class DaemonIPCServer:
                     ln = ln.strip()
                     for prefix in ("[episodic]", "[semantic]", "[procedural]"):
                         if ln.startswith(prefix):
-                            ln = ln[len(prefix):].strip()
+                            ln = ln[len(prefix) :].strip()
                     if ln and len(ln) > 15 and ln.lower() not in ("(empty)", "empty"):
                         memory_lines.append(ln)
 
@@ -806,7 +2029,7 @@ class DaemonIPCServer:
 
             if pending_curiosity:
                 system += (
-                    f"\n\nYou've been thinking about asking: \"{pending_curiosity}\""
+                    f'\n\nYou\'ve been thinking about asking: "{pending_curiosity}"'
                     "\nOnly ask it if it fits naturally at the end of your reply — "
                     "skip it if the topic is unrelated."
                 )
@@ -833,9 +2056,7 @@ class DaemonIPCServer:
 
         inferred = _infer_workspace_intent(message)
         initial_action = (
-            browse_hint or self._step_to_action(inferred)
-            if inferred or browse_hint
-            else None
+            browse_hint or self._step_to_action(inferred) if inferred or browse_hint else None
         )
         if initial_action is None and not _looks_like_agentic_tool_request(message):
             return None
@@ -912,10 +2133,12 @@ class DaemonIPCServer:
         except Exception:
             return None
 
-        results_text = "\n\n".join(
-            f"Tool: {item['tool']}\nOutput:\n{item['output'][:3000]}"
-            for item in tool_results
-        ) or "(no tool results yet)"
+        results_text = (
+            "\n\n".join(
+                f"Tool: {item['tool']}\nOutput:\n{item['output'][:3000]}" for item in tool_results
+            )
+            or "(no tool results yet)"
+        )
 
         prompt = (
             "You are an autonomous local coding assistant deciding the next tool action.\n"
@@ -1225,6 +2448,11 @@ class DaemonIPCServer:
     async def _rpc_status(self) -> dict[str, Any]:
         """Return daemon state and brain state."""
         brain_state = self._brain.get_state()
+        daemon_config = DaemonConfig()
+        telegram_pair_file = daemon_config.state_path / "telegram_chat_id.txt"
+        paired_chat_id = (
+            telegram_pair_file.read_text().strip() if telegram_pair_file.exists() else ""
+        )
         return {
             "daemon": {
                 "started_at": str(self._state.daemon_started_at),
@@ -1239,6 +2467,27 @@ class DaemonIPCServer:
                 name: {"events": stats.events_observed, "last": str(stats.last_event_at)}
                 for name, stats in self._state.observer_stats.items()
             },
+            "pending_approvals": [
+                {
+                    "id": str(a.id),
+                    "description": a.description,
+                    "risk": str(a.risk_level),
+                    "source": a.source,
+                    "proposed_at": str(a.proposed_at),
+                    "context": a.context,
+                }
+                for a in self._autonomy.get_pending()
+            ],
+            "channels": {
+                "telegram": {
+                    "configured": bool(
+                        daemon_config.telegram_token or os.environ.get("JARVIS_TELEGRAM_TOKEN", "")
+                    ),
+                    "paired": bool(paired_chat_id),
+                    "chat_id": paired_chat_id,
+                    "poll_interval_s": daemon_config.telegram_poll_interval_s,
+                }
+            },
             "proactive_inbox": [
                 {
                     "id": m.id,
@@ -1250,6 +2499,16 @@ class DaemonIPCServer:
                 }
                 for m in self._state.proactive_inbox
             ],
+            "chat_history": list(self._chat_history)[-20:],
+            "config": {
+                "socket_path": str(getattr(daemon_config, "socket_path", "")),
+                "log_path": str(getattr(daemon_config, "log_path", "")),
+                "state_path": str(daemon_config.state_path),
+                "webui_enabled": bool(getattr(daemon_config, "webui_enabled", True)),
+                "webui_host": str(getattr(daemon_config, "webui_host", "")),
+                "webui_port": int(getattr(daemon_config, "webui_port", 7777)),
+                "git_journal_enabled": bool(getattr(daemon_config, "git_journal_enabled", False)),
+            },
         }
 
     async def _rpc_chat_clear(self) -> dict[str, Any]:
@@ -1275,6 +2534,7 @@ class DaemonIPCServer:
         """Lazily initialise the JarvisBrowser."""
         if self._browser is None:
             from mnemon.daemon.tools.browser import JarvisBrowser
+
             self._browser = JarvisBrowser(brain=self._brain)
         return self._browser
 
@@ -1372,6 +2632,7 @@ class DaemonIPCServer:
     def _get_workspace(self) -> Any:
         if self._workspace is None:
             from mnemon.daemon.tools.workspace import JarvisWorkspace
+
             self._workspace = JarvisWorkspace(root=Path.cwd())
         return self._workspace
 
@@ -1389,7 +2650,7 @@ class DaemonIPCServer:
 
     async def _rpc_goals_list(self) -> list[dict[str, Any]]:
         """Return all active goals."""
-        goals = self._brain.control.goals.get_active_goals()
+        goals = list(self._brain.control.goals.get_active_goals())
         return [
             {
                 "id": str(g.id),
@@ -1397,14 +2658,14 @@ class DaemonIPCServer:
                 "priority": g.priority,
                 "status": str(g.status),
                 "progress": g.progress,
+                "parent_id": str(g.parent_goal_id) if g.parent_goal_id else None,
                 "subgoals": [str(s) for s in g.subgoals],
+                "success_criteria": g.success_criteria,
             }
             for g in goals
         ]
 
-    async def _rpc_goals_add(
-        self, description: str = "", priority: float = 0.5
-    ) -> dict[str, Any]:
+    async def _rpc_goals_add(self, description: str = "", priority: float = 0.5) -> dict[str, Any]:
         """Create a new goal."""
         if not description:
             return {"error": "description is required"}
@@ -1413,6 +2674,67 @@ class DaemonIPCServer:
             "id": str(goal.id),
             "description": goal.description,
             "priority": goal.priority,
+        }
+
+    async def _rpc_goals_update(
+        self,
+        goal_id: str = "",
+        description: str | None = None,
+        priority: float | None = None,
+        success_criteria: str | None = None,
+    ) -> dict[str, Any]:
+        """Update editable goal fields."""
+        if not goal_id:
+            return {"error": "goal_id is required"}
+
+        try:
+            goal_uuid = UUID(goal_id)
+        except Exception as exc:
+            return {"error": f"invalid goal_id: {exc}"}
+
+        updated = await self._brain.control.goals.update_goal(
+            goal_uuid,
+            description=description,
+            priority=priority,
+            success_criteria=success_criteria,
+        )
+        return {
+            "ok": True,
+            "goal": {
+                "id": str(updated.id),
+                "description": updated.description,
+                "priority": updated.priority,
+                "status": str(updated.status),
+                "progress": updated.progress,
+                "parent_id": str(updated.parent_goal_id) if updated.parent_goal_id else None,
+                "subgoals": [str(s) for s in updated.subgoals],
+                "success_criteria": updated.success_criteria,
+            },
+        }
+
+    async def _rpc_goals_update_status(
+        self,
+        goal_id: str = "",
+        status: str = "",
+    ) -> dict[str, Any]:
+        """Update a goal lifecycle status."""
+        if not goal_id or not status:
+            return {"error": "goal_id and status are required"}
+
+        try:
+            goal_uuid = UUID(goal_id)
+            goal_status = GoalStatus(status)
+        except Exception as exc:
+            return {"error": f"invalid goal update: {exc}"}
+
+        await self._brain.control.goals.update_status(goal_uuid, goal_status)
+        goals = await self._rpc_goals_list()
+        updated = next((goal for goal in goals if goal["id"] == goal_id), None)
+        return {
+            "ok": True,
+            "goal_id": goal_id,
+            "status": status,
+            "goal": updated,
         }
 
     async def _rpc_approve(self, action_id: str = "") -> dict[str, Any]:
@@ -1464,9 +2786,16 @@ class DaemonIPCServer:
                 "risk": str(a.risk_level),
                 "source": a.source,
                 "proposed_at": str(a.proposed_at),
+                "context": a.context,
             }
             for a in self._autonomy.get_pending()
         ]
+
+    async def _rpc_pending_clear(self) -> dict[str, Any]:
+        """Clear all pending approval requests."""
+        cleared = self._autonomy.clear_pending()
+        self._pending_tool_actions.clear()
+        return {"cleared": cleared}
 
     async def _rpc_shutdown(self) -> dict[str, Any]:
         """Request daemon shutdown."""

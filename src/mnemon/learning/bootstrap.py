@@ -33,6 +33,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
 from typing import Any
@@ -171,10 +172,8 @@ class KnowledgeBootstrap:
                     ep_id = await self._brain.memory.episodic.encode(episode)
 
                     # Push to replay buffer with high priority for early consolidation
-                    try:
+                    with contextlib.suppress(Exception):
                         self._brain.learning.replay_buffer.add(ep_id, priority=0.7)
-                    except Exception:
-                        pass
 
                     encoded += 1
                     logger.debug("Bootstrap: encoded Wikipedia article '%s'", title)

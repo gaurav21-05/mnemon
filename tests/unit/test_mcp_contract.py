@@ -18,7 +18,9 @@ from mnemon.memory.valence import ValenceMemoryStore
 from mnemon.services import (
     MemoryService,
     episodes_resource_uri,
+    facts_resource_uri,
     known_resource_uris,
+    profile_resource_uri,
     qualify_tool_name,
     read_resource,
     state_resource_uri,
@@ -89,7 +91,12 @@ def test_qualify_tool_name_uses_namespace_prefix() -> None:
 
 def test_known_resources_are_stable() -> None:
     uris = known_resource_uris("mnemon")
-    assert uris == [state_resource_uri("mnemon"), episodes_resource_uri("mnemon")]
+    assert uris == [
+        state_resource_uri("mnemon"),
+        episodes_resource_uri("mnemon"),
+        facts_resource_uri("mnemon"),
+        profile_resource_uri("mnemon"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -114,6 +121,20 @@ async def test_read_recent_episodes_resource_returns_items() -> None:
     parsed = json.loads(payload["text"])
     assert parsed["count"] == 1
     assert len(parsed["episodes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_recent_facts_and_profile_resources_return_json() -> None:
+    service = build_service()
+    await service.write_memory(content="I now use Anthropic", tags=["profile_static"])
+
+    facts_payload = await read_resource(service, "mnemon", facts_resource_uri("mnemon"))
+    profile_payload = await read_resource(service, "mnemon", profile_resource_uri("mnemon"))
+
+    facts = json.loads(facts_payload["text"])
+    profile = json.loads(profile_payload["text"])
+    assert "facts" in facts
+    assert profile["profile"]["static"][0]["text"] == "I now use Anthropic"
 
 
 @pytest.mark.asyncio

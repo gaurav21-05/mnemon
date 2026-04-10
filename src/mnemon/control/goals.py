@@ -11,14 +11,15 @@ implemented here.
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Final
-from uuid import UUID
+from typing import TYPE_CHECKING, Any, Final
 
 from mnemon.core.exceptions import GoalError
 from mnemon.core.interfaces import GoalManagerInterface, LLMProvider
 from mnemon.core.models import Goal, GoalStatus
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger: Final = logging.getLogger(__name__)
 
@@ -235,15 +236,41 @@ class GoalManager(GoalManagerInterface):
                 self._goals[sid].status == GoalStatus.COMPLETED
                 for sid in sibling_ids
             )
-            if all_complete and sibling_ids:
-                if parent.status not in (GoalStatus.COMPLETED, GoalStatus.FAILED):
-                    parent.status = GoalStatus.COMPLETED
-                    self._goals[parent.id] = parent
-                    logger.info(
-                        "Parent goal %s auto-completed — all %d sub-goals done",
-                        parent.id,
-                        len(sibling_ids),
-                    )
+            if all_complete and sibling_ids and parent.status not in (
+                GoalStatus.COMPLETED,
+                GoalStatus.FAILED,
+            ):
+                parent.status = GoalStatus.COMPLETED
+                self._goals[parent.id] = parent
+                logger.info(
+                    "Parent goal %s auto-completed — all %d sub-goals done",
+                    parent.id,
+                    len(sibling_ids),
+                )
+
+    async def update_goal(
+        self,
+        goal_id: UUID,
+        *,
+        description: str | None = None,
+        priority: float | None = None,
+        success_criteria: str | None = None,
+    ) -> Goal:
+        """Update editable goal fields and return the updated goal."""
+        goal = self._goals.get(goal_id)
+        if goal is None:
+            raise GoalError(f"Goal {goal_id} not found")
+
+        if description is not None:
+            goal.description = description
+        if priority is not None:
+            goal.priority = max(0.0, min(1.0, priority))
+        if success_criteria is not None:
+            goal.success_criteria = success_criteria
+
+        self._goals[goal_id] = goal
+        logger.info("Updated goal %s", goal_id)
+        return goal
 
     def get_active_goals(self) -> list[Goal]:
         """Return all goals with status ACTIVE, sorted by priority descending.

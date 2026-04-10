@@ -19,7 +19,6 @@ from mnemon.backends.memory_store import (
 from mnemon.core.config import MnemonConfig
 from mnemon.core.interfaces import EmbeddingProvider, LLMProvider
 
-
 # ---------------------------------------------------------------------------
 # Config fixture
 # ---------------------------------------------------------------------------

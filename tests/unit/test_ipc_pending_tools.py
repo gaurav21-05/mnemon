@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import UUID
 
 import pytest
 
-from mnemon.core.models import Goal
 from mnemon.daemon.autonomy import AutonomyController
 from mnemon.daemon.config import DaemonConfig
 from mnemon.daemon.ipc import DaemonIPCServer
@@ -28,7 +26,12 @@ class _DummyIdleLoop:
 
 
 class _DummyLLM:
-    async def generate_structured(self, prompt: str, response_schema: dict, **kwargs: object) -> dict:
+    async def generate_structured(
+        self,
+        prompt: str,
+        response_schema: dict,
+        **kwargs: object,
+    ) -> dict:
         return {"steps": []}
 
 

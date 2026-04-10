@@ -11,14 +11,14 @@ how the brain organises concepts into semantic neighbourhoods.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import random
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from mnemon.core.config import SemanticConfig
 from mnemon.core.exceptions import MemoryError, RetrievalError
 from mnemon.core.interfaces import (
     DocumentStore,
@@ -38,6 +38,9 @@ from mnemon.core.models import (
     SemanticTriple,
 )
 
+if TYPE_CHECKING:
+    from mnemon.core.config import SemanticConfig
+
 logger = logging.getLogger(__name__)
 
 # Document type discriminator injected into every stored dict.
@@ -45,6 +48,13 @@ _TYPE_ENTITY = "entity"
 _TYPE_TRIPLE = "triple"
 _TYPE_COMMUNITY = "community"
 _TYPE_CLUSTER = "cluster"
+
+
+def _object_identity(value: EntityRef | str) -> str:
+    """Return a stable comparison key for a triple object."""
+    if isinstance(value, EntityRef):
+        return f"entity:{value.entity_id}"
+    return f"literal:{value.strip().lower()}"
 
 
 class SemanticMemoryStore(SemanticMemoryInterface):
@@ -113,10 +123,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
 
     def _build_triple_metadata(self, doc: dict[str, Any]) -> dict[str, Any]:
         obj = doc.get("object")
-        if isinstance(obj, dict):
-            object_name = obj.get("name", "")
-        else:
-            object_name = str(obj)
+        object_name = obj.get("name", "") if isinstance(obj, dict) else str(obj)
         subject = doc.get("subject", {})
         return {
             "triple_id": doc["id"],
@@ -182,7 +189,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
         if hasattr(self._vectors, "_store"):
             store = getattr(self._vectors, "_store", {})
             if isinstance(store, dict):
-                return {str(key) for key in store.keys()}
+                return {str(key) for key in store}
         return None
 
     async def _clear_vector_store(self) -> None:
@@ -212,7 +219,8 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                 self._consistency_checked = True
                 return
             logger.warning(
-                "SemanticMemoryStore: vector/doc count mismatch (%d != %d) but vector IDs are unavailable; leaving store unchanged.",
+                "SemanticMemoryStore: vector/doc count mismatch (%d != %d) "
+                "but vector IDs are unavailable; leaving store unchanged.",
                 current_count,
                 len(expected_items),
             )
@@ -307,7 +315,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
         """Return the cosine similarity between two equal-length vectors."""
-        dot = sum(x * y for x, y in zip(a, b))
+        dot = sum(x * y for x, y in zip(a, b, strict=False))
         norm_a = math.sqrt(sum(x * x for x in a))
         norm_b = math.sqrt(sum(x * x for x in b))
         if norm_a == 0.0 or norm_b == 0.0:
@@ -342,7 +350,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
         dim = len(embeddings[0])
         sums: list[list[float]] = [[0.0] * dim for _ in range(k)]
         counts: list[int] = [0] * k
-        for emb, idx in zip(embeddings, assignments):
+        for emb, idx in zip(embeddings, assignments, strict=False):
             for d in range(dim):
                 sums[idx][d] += emb[d]
             counts[idx] += 1
@@ -466,12 +474,66 @@ class SemanticMemoryStore(SemanticMemoryInterface):
         written = 0
         for triple in triples:
             triple_doc_id = self._triple_doc_id(triple.id)
+            now = datetime.now(UTC)
 
-            # Deduplication: skip if already stored.
+            # Exact ID deduplication: already persisted.
             existing = await self._docs.get(triple_doc_id)
             if existing is not None:
                 logger.debug("Triple id=%s already exists — skipping", triple.id)
                 continue
+
+            # Semantic conflict scan: same subject+predicate with current truth.
+            all_triple_docs = await self._docs.query(filters={"_type": _TYPE_TRIPLE}, limit=10_000)
+            same_slot_docs = [
+                doc
+                for doc in all_triple_docs
+                if doc.get("current", True)
+                and isinstance(doc.get("subject"), dict)
+                and doc["subject"].get("entity_id") == str(triple.subject.entity_id)
+                and doc.get("predicate") == triple.predicate
+            ]
+
+            matching_doc = next(
+                (
+                    doc
+                    for doc in same_slot_docs
+                    if _object_identity(SemanticTriple.model_validate(doc).object)
+                    == _object_identity(triple.object)
+                ),
+                None,
+            )
+            if matching_doc is not None:
+                merged_sources = list(
+                    dict.fromkeys(
+                        [
+                            *matching_doc.get("source_episodes", []),
+                            *[str(item) for item in triple.source_episodes],
+                        ]
+                    )
+                )
+                matching_doc["source_episodes"] = merged_sources
+                matching_doc["confidence"] = max(
+                    float(matching_doc.get("confidence", 0.0) or 0.0),
+                    triple.confidence,
+                )
+                matching_doc["last_confirmed"] = now.isoformat()
+                await self._docs.put(UUID(str(matching_doc["id"])), matching_doc)
+                written += 1
+                continue
+
+            contradiction_group = (
+                f"{triple.subject.entity_id}:{triple.predicate}"
+                if same_slot_docs
+                else None
+            )
+            superseded_ids: list[str] = []
+            for doc in same_slot_docs:
+                doc["current"] = False
+                doc["valid_to"] = now.isoformat()
+                doc["superseded_by"] = str(triple.id)
+                doc["contradiction_group"] = contradiction_group
+                await self._docs.put(UUID(str(doc["id"])), doc)
+                superseded_ids.append(str(doc["id"]))
 
             try:
                 # Ensure subject entity node exists.
@@ -502,6 +564,12 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                 # repair can deterministically rebuild vectors from documents.
                 doc = triple.model_dump(mode="json")
                 doc["_type"] = _TYPE_TRIPLE
+                doc["current"] = True
+                doc["valid_from"] = now.isoformat()
+                doc["valid_to"] = None
+                doc["supersedes"] = superseded_ids
+                doc["superseded_by"] = None
+                doc["contradiction_group"] = contradiction_group
                 await self._docs.put(triple_doc_id, doc)
 
                 # Index the triple embedding when available.
@@ -626,6 +694,11 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                         seen_triple_ids.add(tid)
                         triples.append(SemanticTriple.model_validate(doc))
 
+            triples.sort(
+                key=lambda triple: (int(triple.current), triple.confidence, triple.last_confirmed),
+                reverse=True,
+            )
+
             logger.debug(
                 "retrieve_by_entity entity=%s hops=%d found=%d triples",
                 entity_ref.entity_id,
@@ -668,6 +741,11 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                 doc = await self._docs.get(UUID(triple_id_str))
                 if doc is not None and doc.get("_type") == _TYPE_TRIPLE:
                     triples.append(SemanticTriple.model_validate(doc))
+
+            triples.sort(
+                key=lambda triple: (int(triple.current), triple.confidence, triple.last_confirmed),
+                reverse=True,
+            )
 
             logger.debug("retrieve_by_similarity top_k=%d found=%d", top_k, len(triples))
             return triples
@@ -773,7 +851,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
 
             # Group triples by cluster assignment.
             cluster_groups: dict[int, list[SemanticTriple]] = {}
-            for triple, assignment in zip(embedded_triples, assignments):
+            for triple, assignment in zip(embedded_triples, assignments, strict=False):
                 cluster_groups.setdefault(assignment, []).append(triple)
 
             current_level_clusters: list[SemanticCluster] = []
@@ -854,7 +932,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                 assignments = self._kmeans_cluster(cluster_embeddings, k_clusters)
 
                 group_map: dict[int, list[SemanticCluster]] = {}
-                for cluster, assignment in zip(embeddable, assignments):
+                for cluster, assignment in zip(embeddable, assignments, strict=False):
                     group_map.setdefault(assignment, []).append(cluster)
 
                 next_level_clusters: list[SemanticCluster] = []
@@ -984,7 +1062,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                     id=community_id,
                     name=f"Community-{community_id}",
                     member_entities=member_ids,
-                    last_updated=datetime.now(timezone.utc),
+                    last_updated=datetime.now(UTC),
                 )
                 doc = community.model_dump(mode="json")
                 doc["_type"] = _TYPE_COMMUNITY
@@ -1002,7 +1080,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
             # ----------------------------------------------------------------
             decay_epsilon = self._config.decay.epsilon
             confirmation_window_days = self._config.decay.confirmation_window
-            cutoff = datetime.now(timezone.utc) - timedelta(days=confirmation_window_days)
+            cutoff = datetime.now(UTC) - timedelta(days=confirmation_window_days)
 
             triple_docs = await self._docs.query(
                 filters={"_type": _TYPE_TRIPLE},
@@ -1018,7 +1096,7 @@ class SemanticMemoryStore(SemanticMemoryInterface):
 
                 last_confirmed = datetime.fromisoformat(last_confirmed_raw)
                 if last_confirmed.tzinfo is None:
-                    last_confirmed = last_confirmed.replace(tzinfo=timezone.utc)
+                    last_confirmed = last_confirmed.replace(tzinfo=UTC)
 
                 if last_confirmed >= cutoff:
                     continue  # Still within confirmation window; no decay.
@@ -1036,10 +1114,8 @@ class SemanticMemoryStore(SemanticMemoryInterface):
                 if new_confidence < 0.05:
                     # Soft-delete: remove from all stores.
                     await self._docs.delete(triple_id)
-                    try:
+                    with contextlib.suppress(Exception):
                         await self._vectors.delete(triple_id)
-                    except Exception:
-                        pass  # Vector may not exist for unembedded triples.
                     pruned += 1
                     logger.debug("Pruned low-confidence triple id=%s", triple_id)
                 else:

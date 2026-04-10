@@ -20,12 +20,13 @@ import logging
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from mnemon.daemon.tools.workspace import JarvisWorkspace
+if TYPE_CHECKING:
+    from mnemon.daemon.tools.workspace import JarvisWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class PatchStep:
 class ImprovementSession:
     id: UUID = field(default_factory=uuid4)
     phase: Phase = field(default=Phase.IDLE)
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     analysis_summary: str = ""
     plan_summary: str = ""
     patch_steps: list[PatchStep] = field(default_factory=list)
@@ -187,9 +188,12 @@ class SelfImprovementOrchestrator:
             plan_prompt = (
                 f"You are an AI that improves its own codebase. Goal: {goal}\n\n"
                 f"Current state: {session.analysis_summary}\n\n"
-                "Produce a JSON plan with key 'summary' (one sentence) and 'steps' (list of patches).\n"
-                "Each step: {description, file (relative path from repo root), search (exact text to find), replace (replacement text)}.\n"
-                "Only include steps where the search text will be found exactly as-is in the file.\n"
+                "Produce a JSON plan with key 'summary' (one sentence) and "
+                "'steps' (list of patches).\n"
+                "Each step: {description, file (relative path from repo root), "
+                "search (exact text to find), replace (replacement text)}.\n"
+                "Only include steps where the search text will be found "
+                "exactly as-is in the file.\n"
                 "Max 5 steps. Return JSON only."
             )
             try:

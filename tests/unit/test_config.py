@@ -21,7 +21,8 @@ from mnemon.core.config import (
 )
 from mnemon.core.exceptions import ConfigError
 from mnemon.core.models import EvictionPolicy
-
+from mnemon.daemon.config import DaemonConfig
+from mnemon.daemon.observers.web import WebLearningObserver
 
 # ---------------------------------------------------------------------------
 # Default values
@@ -31,6 +32,15 @@ from mnemon.core.models import EvictionPolicy
 def test_default_config_is_valid() -> None:
     cfg = MnemonConfig()
     assert cfg is not None
+    daemon_observers = DaemonConfig().observers
+    assert daemon_observers.web_learning_enabled is False
+    assert daemon_observers.web_learning_use_defaults is False
+
+
+def test_web_learning_observer_has_no_implicit_news_sources() -> None:
+    observer = WebLearningObserver()
+
+    assert observer._sources == []
 
 
 def test_cycle_defaults() -> None:

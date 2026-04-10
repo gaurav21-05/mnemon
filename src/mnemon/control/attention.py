@@ -11,11 +11,13 @@ for non-salient inputs, mirroring the adaptive threshold logic implemented here.
 from __future__ import annotations
 
 import logging
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
-from mnemon.core.config import AttentionConfig
 from mnemon.core.interfaces import AttentionControllerInterface, ValenceMemoryInterface
 from mnemon.core.models import GateDecision, Goal, PerceptUnit, SalienceScore
+
+if TYPE_CHECKING:
+    from mnemon.core.config import AttentionConfig
 
 logger: Final = logging.getLogger(__name__)
 
@@ -162,7 +164,10 @@ class AttentionController(AttentionControllerInterface):
             Current occupancy of working memory in [0, 1] where 1 = full.
         """
         if not self._config.adaptive_thresholds:
-            logger.debug("Adaptive thresholds disabled — ignoring cognitive_load=%.3f", cognitive_load)
+            logger.debug(
+                "Adaptive thresholds disabled — ignoring cognitive_load=%.3f",
+                cognitive_load,
+            )
             return
 
         load = max(0.0, min(1.0, cognitive_load))

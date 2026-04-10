@@ -43,6 +43,23 @@ def cmd_start(args: argparse.Namespace) -> None:
 
     daemon_config = DaemonConfig()
     mnemon_config = load_config(args.config) if args.config else MnemonConfig()
+    provider_name = mnemon_config.llm.default_provider
+    provider = {**mnemon_config.llm.providers.get(provider_name, {})}
+    if getattr(args, "local", False):
+        provider.update(
+            {
+                "model": "ollama/llama3.2",
+                "embedding_model": "ollama/nomic-embed-text",
+                "embedding_dimensions": 768,
+            }
+        )
+    if getattr(args, "model", None):
+        provider["model"] = args.model
+    if getattr(args, "embedding_model", None):
+        provider["embedding_model"] = args.embedding_model
+    if getattr(args, "embedding_dim", None) is not None:
+        provider["embedding_dimensions"] = args.embedding_dim
+    mnemon_config.llm.providers[provider_name] = provider
 
     process = DaemonProcess(daemon_config, mnemon_config)
 
@@ -137,6 +154,176 @@ def cmd_thoughts(args: argparse.Namespace) -> None:
 
     for t in thoughts:
         print(f"  [{t['timestamp']}] {t['activity']}: {t['summary']}")
+
+
+def cmd_memory_search(args: argparse.Namespace) -> None:
+    """Search episodic memory with compact indexed results."""
+    client = _get_client()
+    result = anyio.run(client.memory_recall, args.query, args.top_k, args.scope, args.scope_id)
+
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return
+
+    profile = result.get("profile") or {}
+    static = profile.get("static") or []
+    dynamic = profile.get("dynamic") or []
+    if static or dynamic:
+        print("Profile context:")
+        for item in (profile.get("static_facts") or [])[:2]:
+            citations = ", ".join(item.get("citations") or [])
+            suffix = f" ({citations})" if citations else ""
+            print(f"  static  • {item.get('text', '')}{suffix}")
+        for item in (profile.get("dynamic_facts") or [])[:3]:
+            citations = ", ".join(item.get("citations") or [])
+            suffix = f" ({citations})" if citations else ""
+            print(f"  dynamic • {item.get('text', '')}{suffix}")
+        print()
+
+    _print_memory_index_items(result.get("results", []))
+
+
+def cmd_memory_get(args: argparse.Namespace) -> None:
+    """Fetch full memory records by id."""
+    client = _get_client()
+    result = anyio.run(client.memory_get, args.ids)
+
+    for item in result.get("items", []):
+        print(f"[{item.get('id')}] {item.get('timestamp')}")
+        if item.get("tags"):
+            print(f"  tags: {', '.join(item['tags'])}")
+        if item.get("citation"):
+            print(f"  citation: {item['citation']}")
+        print(f"  context: {item.get('context', '')}")
+        print(f"  action:  {item.get('action', '')}")
+        print(f"  outcome: {item.get('outcome', '')}")
+        print()
+
+    missing = result.get("missing", [])
+    if missing:
+        print(f"Missing: {', '.join(missing)}")
+
+
+def cmd_memory_profile(args: argparse.Namespace) -> None:
+    """Show the daemon's structured memory profile for the user."""
+    client = _get_client()
+    result = anyio.run(client.memory_profile)
+
+    for label, key in (
+        ("Static", "static"),
+        ("Dynamic", "dynamic"),
+        ("Questions", "questions"),
+    ):
+        items = result.get(key, [])
+        print(f"{label}:")
+        if items:
+            fact_key = {
+                "static": "static_facts",
+                "dynamic": "dynamic_facts",
+                "questions": "question_facts",
+            }[key]
+            fact_items = result.get(fact_key, [])
+            if fact_items:
+                for item in fact_items:
+                    citations = ", ".join(item.get("citations") or [])
+                    suffix = f" ({citations})" if citations else ""
+                    print(f"  - {item.get('text', '')}{suffix}")
+            else:
+                for item in items:
+                    print(f"  - {item}")
+        else:
+            print("  (none yet)")
+        print()
+
+    top_tags = result.get("top_tags", [])
+    if top_tags:
+        print("Top tags:")
+        for item in top_tags:
+            print(f"  - {item['tag']} ({item['count']})")
+
+
+def cmd_memory_timeline(args: argparse.Namespace) -> None:
+    """Show the local memory timeline around one anchor memory."""
+    client = _get_client()
+    result = anyio.run(client.memory_timeline, args.anchor_id, args.limit)
+
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return
+
+    for item in result.get("items", []):
+        marker = "*" if item.get("anchor") else "-"
+        tags = f" [{', '.join(item['tags'])}]" if item.get("tags") else ""
+        print(f"{marker} {item.get('timestamp')} {item.get('id')}{tags}")
+        print(f"    {item.get('preview', '')}")
+
+
+def cmd_scenario(args: argparse.Namespace) -> None:
+    """Run a bounded what-if analysis grounded in memory and goals."""
+    client = _get_client()
+    result = anyio.run(client.run_scenario, args.scenario, args.scope, args.scope_id)
+
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return
+
+    print(f"Scenario: {result.get('scenario', '')}")
+    print(f"Summary: {result.get('summary', '')}")
+    print(f"Uncertainty: {result.get('uncertainty', '')}")
+    print()
+    for label, key in (
+        ("Assumptions", "assumptions"),
+        ("Risks", "risks"),
+        ("Recommendations", "recommendations"),
+    ):
+        print(f"{label}:")
+        items = result.get(key, [])
+        if items:
+            for item in items:
+                print(f"  - {item}")
+        else:
+            print("  (none)")
+        print()
+    citations = result.get("citations", [])
+    if citations:
+        print("Sources:")
+        for item in citations:
+            print(f"  - {item}")
+
+
+def cmd_report(args: argparse.Namespace) -> None:
+    """Generate a grounded weekly or project report."""
+    client = _get_client()
+    result = anyio.run(client.run_report, args.type, args.focus, args.scope, args.scope_id)
+
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return
+
+    print(f"Report: {result.get('title', '')}")
+    print(f"Type: {result.get('type', '')}")
+    if result.get("focus"):
+        print(f"Focus: {result.get('focus')}")
+    print(f"Summary: {result.get('summary', '')}")
+    print()
+    for label, key in (
+        ("Highlights", "highlights"),
+        ("Risks", "risks"),
+        ("Next steps", "next_steps"),
+    ):
+        print(f"{label}:")
+        items = result.get(key, [])
+        if items:
+            for item in items:
+                print(f"  - {item}")
+        else:
+            print("  (none)")
+        print()
+    citations = result.get("citations", [])
+    if citations:
+        print("Sources:")
+        for item in citations:
+            print(f"  - {item}")
 
 
 def cmd_goals_add(args: argparse.Namespace) -> None:
@@ -457,6 +644,27 @@ def _print_chat_result(result: dict) -> None:
         print(f"\n{result['reply']}")
 
 
+def _print_memory_index_items(items: list[dict[str, object]]) -> None:
+    """Pretty-print compact search results with IDs for follow-up lookup."""
+    if not items:
+        print("No memory matches.")
+        return
+
+    print("Matches:")
+    for item in items:
+        score = float(item.get("score") or 0.0)
+        timestamp = str(item.get("timestamp") or "?")
+        memory_id = str(item.get("id") or "?")
+        preview = str(item.get("preview") or item.get("content") or "")
+        tags = item.get("tags") or []
+        tag_text = f" [{', '.join(str(tag) for tag in tags)}]" if tags else ""
+        print(f"  - {memory_id}  {(score * 100):.0f}%  {timestamp}{tag_text}")
+        print(f"    {preview}")
+        citation = str(item.get("citation") or "")
+        if citation:
+            print(f"    cite: {citation}")
+
+
 def _handle_repl_command(client, cmd: str) -> None:
     """Handle slash commands in the REPL."""
     parts = cmd.split()
@@ -476,6 +684,20 @@ def _handle_repl_command(client, cmd: str) -> None:
             goals = anyio.run(client.list_goals)
             for g in goals:
                 print(f"  [{g['priority']:.1f}] {g['description']} ({g['status']})")
+        elif command == "/profile":
+            result = anyio.run(client.memory_profile)
+            for item in result.get("static", [])[:2]:
+                print(f"  static  • {item}")
+            for item in result.get("dynamic", [])[:3]:
+                print(f"  dynamic • {item}")
+        elif command == "/memories":
+            query = cmd[len("/memories"):].strip()
+            if not query:
+                recent = anyio.run(client.memory_recent, 5)
+                _print_memory_index_items(recent.get("items", []))
+            else:
+                result = anyio.run(client.memory_search, query, 5)
+                _print_memory_index_items(result.get("results", []))
         elif command == "/pending":
             pending = anyio.run(client.pending)
             for a in pending:
@@ -531,6 +753,8 @@ def _handle_repl_command(client, cmd: str) -> None:
             print("  /status    - Daemon status")
             print("  /thoughts  - Recent idle thinking")
             print("  /goals     - Active goals")
+            print("  /profile   - Structured memory profile")
+            print("  /memories [query] - Recent memories or search memories")
             print("  /pending   - Pending approvals")
             print("  /browse    - Browse the web")
             print("  /ls        - List workspace files")
@@ -552,7 +776,7 @@ def _handle_repl_command(client, cmd: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
         prog="mnemon-daemon",
@@ -564,6 +788,15 @@ def main() -> None:
     p_start = subparsers.add_parser("start", help="Start the daemon")
     p_start.add_argument("--foreground", "-f", action="store_true", help="Run in foreground")
     p_start.add_argument("--config", "-c", type=str, help="Path to mnemon.toml config file")
+    p_start.add_argument("--local", action="store_true", help="Use local Ollama defaults")
+    p_start.add_argument("--model", default=None, help="Override chat model")
+    p_start.add_argument("--embedding-model", default=None, help="Override embedding model")
+    p_start.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=None,
+        help="Override embedding dimensions",
+    )
     p_start.set_defaults(func=cmd_start)
 
     # daemon stop
@@ -678,6 +911,80 @@ def main() -> None:
     p_thoughts.add_argument("--limit", "-n", type=int, default=10)
     p_thoughts.set_defaults(func=cmd_thoughts)
 
+    # memory
+    p_memory = subparsers.add_parser("memory", help="Structured memory inspection")
+    memory_sub = p_memory.add_subparsers(dest="memory_command")
+
+    p_memory_search = memory_sub.add_parser("search", help="Search episodic memory")
+    p_memory_search.add_argument("query", help="Natural-language memory query")
+    p_memory_search.add_argument("--top-k", type=int, default=5, help="Result count")
+    p_memory_search.add_argument(
+        "--scope",
+        choices=["all", "personal", "workspace"],
+        default="all",
+        help="Limit recall to a scope",
+    )
+    p_memory_search.add_argument("--scope-id", default=None, help="Optional explicit scope id")
+    p_memory_search.set_defaults(func=cmd_memory_search)
+
+    p_memory_recall = memory_sub.add_parser(
+        "recall",
+        help="Profile-aware recall (profile + relevant memories)",
+    )
+    p_memory_recall.add_argument("query", help="Natural-language memory query")
+    p_memory_recall.add_argument("--top-k", type=int, default=5, help="Result count")
+    p_memory_recall.add_argument(
+        "--scope",
+        choices=["all", "personal", "workspace"],
+        default="all",
+        help="Limit recall to a scope",
+    )
+    p_memory_recall.add_argument("--scope-id", default=None, help="Optional explicit scope id")
+    p_memory_recall.set_defaults(func=cmd_memory_search)
+
+    p_scenario = subparsers.add_parser("scenario", help="Run a bounded what-if analysis")
+    p_scenario.add_argument("scenario", help="Scenario question")
+    p_scenario.add_argument(
+        "--scope",
+        choices=["all", "personal", "workspace"],
+        default="all",
+        help="Limit grounding to a scope",
+    )
+    p_scenario.add_argument("--scope-id", default=None, help="Optional explicit scope id")
+    p_scenario.set_defaults(func=cmd_scenario)
+
+    p_report = subparsers.add_parser("report", help="Generate a weekly or project report")
+    p_report.add_argument(
+        "--type",
+        choices=["weekly", "project"],
+        default="weekly",
+        help="Report type",
+    )
+    p_report.add_argument("--focus", default="", help="Optional focus area or project name")
+    p_report.add_argument(
+        "--scope",
+        choices=["all", "personal", "workspace"],
+        default="all",
+        help="Limit grounding to a scope",
+    )
+    p_report.add_argument("--scope-id", default=None, help="Optional explicit scope id")
+    p_report.set_defaults(func=cmd_report)
+
+    p_memory_get = memory_sub.add_parser("get", help="Fetch full memory records by id")
+    p_memory_get.add_argument("ids", nargs="+", help="Episode IDs")
+    p_memory_get.set_defaults(func=cmd_memory_get)
+
+    p_memory_profile = memory_sub.add_parser("profile", help="Show structured user profile")
+    p_memory_profile.set_defaults(func=cmd_memory_profile)
+
+    p_memory_timeline = memory_sub.add_parser(
+        "timeline",
+        help="Show nearby memories around one anchor event",
+    )
+    p_memory_timeline.add_argument("anchor_id", help="Anchor episode ID")
+    p_memory_timeline.add_argument("--limit", type=int, default=6, help="Timeline size")
+    p_memory_timeline.set_defaults(func=cmd_memory_timeline)
+
     # goals
     p_goals = subparsers.add_parser("goals", help="Goal management")
     goals_sub = p_goals.add_subparsers(dest="goals_command")
@@ -736,7 +1043,7 @@ def main() -> None:
     )
     p_learn.set_defaults(func=cmd_learn)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
         sys.exit(1)

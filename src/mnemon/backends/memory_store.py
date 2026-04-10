@@ -18,10 +18,9 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
+from uuid import UUID  # noqa: TC003
 
-from mnemon.core.config import MnemonConfig
 from mnemon.core.interfaces import (
     DocumentStore,
     GraphNode,
@@ -31,6 +30,9 @@ from mnemon.core.interfaces import (
     VectorSearchResult,
     VectorStore,
 )
+
+if TYPE_CHECKING:
+    from mnemon.core.config import MnemonConfig
 
 __all__ = [
     "InMemoryVectorStore",
@@ -53,7 +55,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """
     if len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))
     if norm_a == 0.0 or norm_b == 0.0:
@@ -65,10 +67,7 @@ def _matches_filters(document: dict[str, Any], filters: dict[str, Any] | None) -
     """Return True if *document* satisfies all equality predicates in *filters*."""
     if not filters:
         return True
-    for key, expected in filters.items():
-        if document.get(key) != expected:
-            return False
-    return True
+    return all(document.get(key) == expected for key, expected in filters.items())
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +418,7 @@ class InMemoryGraphStore(GraphStore):
             )
             dangling_contrib = dangling_mass / n
 
-            for i, nid in enumerate(all_nodes):
+            for i, _nid in enumerate(all_nodes):
                 new_scores[i] = damping_comp * teleport[i] + damping * dangling_contrib
 
             for i, nid in enumerate(all_nodes):
@@ -490,7 +489,7 @@ class InMemoryGraphStore(GraphStore):
                     lbl = labels[nb]
                     freq[lbl] = freq.get(lbl, 0) + 1
 
-                best_label = max(freq, key=lambda l: freq[l])
+                best_label = max(freq, key=lambda label: freq[label])
                 if labels[nid] != best_label:
                     labels[nid] = best_label
                     changed = True

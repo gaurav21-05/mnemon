@@ -40,6 +40,7 @@ To customise configuration::
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -168,7 +169,7 @@ class Mnemon:
     # Async context manager — starts/stops the bus with a managed TaskGroup
     # ------------------------------------------------------------------
 
-    async def __aenter__(self) -> "Mnemon":
+    async def __aenter__(self) -> Mnemon:
         """Start the CognitiveBus within a managed TaskGroup.
 
         Use ``async with`` to ensure the bus is properly started and stopped::
@@ -206,10 +207,8 @@ class Mnemon:
         if self._task_group is not None:
             # Cancel the task group to stop the dispatch loop coroutine
             self._task_group.cancel_scope.cancel()
-            try:
+            with suppress(Exception):
                 await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
-            except Exception:
-                pass  # Task group may raise on cancel; safe to suppress
             self._task_group = None
         logger.info("Mnemon context exited — CognitiveBus stopped.")
 
@@ -442,7 +441,14 @@ class MnemonFactory:
             sensory = self._build_sensory(config, embedder)
             working = self._build_working(config, llm)
             episodic = self._build_episodic(config, episodic_vs, episodic_ds, embedder)
-            semantic = self._build_semantic(config, semantic_gs, semantic_vs, semantic_ds, embedder, llm)
+            semantic = self._build_semantic(
+                config,
+                semantic_gs,
+                semantic_vs,
+                semantic_ds,
+                embedder,
+                llm,
+            )
             procedural = self._build_procedural(config, procedural_vs, procedural_ds, embedder)
             valence = self._build_valence(config, embedder)
         except ConfigError:
@@ -862,8 +868,8 @@ class MnemonFactory:
         """
         try:
             from mnemon.scheduling.scheduler import (
-                ConsolidationScheduler,
                 _APSCHEDULER_AVAILABLE,
+                ConsolidationScheduler,
             )
         except ImportError:
             logger.debug(
@@ -883,7 +889,10 @@ class MnemonFactory:
                 config=config.consolidation.schedule,
                 consolidation_engine=consolidation,
             )
-            logger.info("ConsolidationScheduler created (mode=%s).", config.consolidation.schedule.mode)
+            logger.info(
+                "ConsolidationScheduler created (mode=%s).",
+                config.consolidation.schedule.mode,
+            )
             return scheduler
         except Exception as exc:
             logger.warning(

@@ -15,13 +15,15 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
 from mnemon.core.config import MnemonConfig
 from mnemon.core.exceptions import ConfigError
-from mnemon.daemon.config import DaemonConfig
+
+if TYPE_CHECKING:
+    from mnemon.daemon.config import DaemonConfig
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ class DaemonProcess:
         self._daemon_config = daemon_config
         self._mnemon_config = mnemon_config or MnemonConfig()
         self._shutdown_requested = False
+        self._active_daemon: Any | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -58,7 +61,10 @@ class DaemonProcess:
         existing = self.status()
         if existing.get("running"):
             pid = existing.get("pid", "?")
-            print(f"Daemon already running (pid={pid}). Stop it first with: mnemon daemon stop")
+            print(
+                "Daemon already running "
+                f"(pid={pid}). Stop it first with: mnemon daemon stop"
+            )
             return
 
         if not foreground:
@@ -93,7 +99,11 @@ class DaemonProcess:
                     "Daemon crashed (attempt %d/%d). %s",
                     attempts,
                     max_attempts,
-                    "Restarting..." if self._daemon_config.auto_restart and attempts < max_attempts else "Giving up.",
+                    (
+                        "Restarting..."
+                        if self._daemon_config.auto_restart and attempts < max_attempts
+                        else "Giving up."
+                    ),
                 )
                 if not self._daemon_config.auto_restart:
                     break
@@ -112,8 +122,29 @@ class DaemonProcess:
             pid = int(pid_path.read_text().strip())
             os.kill(pid, signal.SIGTERM)
             print(f"Sent SIGTERM to daemon (pid={pid}).")
+            import time as _time
+            end = _time.time() + 5.0
+            while _time.time() < end:
+                if not self._pid_is_live(pid):
+                    pid_path.unlink(missing_ok=True)
+                    print("Daemon stopped cleanly.")
+                    return
+                _time.sleep(0.2)
+
+            print("Daemon did not exit after SIGTERM; sending SIGKILL...")
+            os.kill(pid, signal.SIGKILL)
+
+            hard_end = _time.time() + 2.0
+            while _time.time() < hard_end:
+                if not self._pid_is_live(pid):
+                    pid_path.unlink(missing_ok=True)
+                    print("Daemon force-stopped.")
+                    return
+                _time.sleep(0.1)
+
+            print("Daemon is still present after SIGKILL. Check process state manually.")
         except ProcessLookupError:
-            print(f"Daemon process not found. Removing stale PID file.")
+            print("Daemon process not found. Removing stale PID file.")
             pid_path.unlink(missing_ok=True)
         except Exception as exc:
             print(f"Failed to stop daemon: {exc}")
@@ -126,7 +157,9 @@ class DaemonProcess:
 
         try:
             pid = int(pid_path.read_text().strip())
-            os.kill(pid, 0)  # Check if process exists
+            if not self._pid_is_live(pid):
+                pid_path.unlink(missing_ok=True)
+                return {"running": False, "reason": "stale pid file"}
             return {"running": True, "pid": pid}
         except (ProcessLookupError, ValueError):
             return {"running": False, "reason": "stale pid file"}
@@ -149,11 +182,15 @@ class DaemonProcess:
 
         factory = DaemonFactory(daemon_config, self._mnemon_config)
         daemon = await factory.build()
+        self._active_daemon = daemon
 
         try:
             await daemon.run()
         finally:
-            await daemon.shutdown()
+            try:
+                await daemon.shutdown()
+            finally:
+                self._active_daemon = None
 
     # ------------------------------------------------------------------
     # OS-level helpers
@@ -174,9 +211,9 @@ class DaemonProcess:
             sys.exit(0)  # First child exits
 
         # Redirect stdio to /dev/null
-        sys.stdin = open(os.devnull, "r")
-        sys.stdout = open(os.devnull, "w")
-        sys.stderr = open(os.devnull, "w")
+        sys.stdin = os.fdopen(os.open(os.devnull, os.O_RDONLY))
+        sys.stdout = os.fdopen(os.open(os.devnull, os.O_WRONLY), "w")
+        sys.stderr = os.fdopen(os.open(os.devnull, os.O_WRONLY), "w")
 
     def _write_pid(self) -> None:
         """Write current PID to the configured PID file."""
@@ -215,9 +252,33 @@ class DaemonProcess:
         def _handle_term(signum: int, frame: Any) -> None:
             logger.info("Received signal %d — initiating shutdown.", signum)
             self._shutdown_requested = True
+            if self._active_daemon is not None:
+                try:
+                    self._active_daemon.request_shutdown()
+                except Exception:
+                    logger.exception("Failed to request daemon shutdown from signal handler.")
 
         signal.signal(signal.SIGTERM, _handle_term)
         signal.signal(signal.SIGINT, _handle_term)
+
+    def _pid_is_live(self, pid: int) -> bool:
+        """Return True when *pid* exists and is not a zombie."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+
+        stat_path = Path(f"/proc/{pid}/stat")
+        if not stat_path.exists():
+            return True
+
+        try:
+            raw = stat_path.read_text(encoding="utf-8")
+        except Exception:
+            return True
+
+        parts = raw.split()
+        return not (len(parts) >= 3 and parts[2] == "Z")
 
     def _setup_logging(self, foreground: bool = False) -> None:
         """Configure logging for the daemon."""

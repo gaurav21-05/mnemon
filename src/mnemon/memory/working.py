@@ -11,12 +11,11 @@ information when the workspace becomes overloaded.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from datetime import datetime, timezone
-from typing import Any
-from uuid import uuid4
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-from mnemon.core.config import WorkingMemoryConfig
 from mnemon.core.exceptions import TokenBudgetExceededError
 from mnemon.core.interfaces import LLMProvider, WorkingMemoryInterface
 from mnemon.core.models import (
@@ -28,6 +27,9 @@ from mnemon.core.models import (
     RetrievedItem,
     WorkingMemoryState,
 )
+
+if TYPE_CHECKING:
+    from mnemon.core.config import WorkingMemoryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -118,10 +120,8 @@ class WorkingMemoryManager(WorkingMemoryInterface):
             b for b in self._state.active_context if b.id != block.id
         ]
         self._state.token_used = max(0, self._state.token_used - block.token_count)
-        try:
+        with contextlib.suppress(ValueError):
             self._insertion_order.remove(str(block.id))
-        except ValueError:
-            pass
 
     def _add_block(self, block: ContextBlock) -> None:
         """Append *block* to active_context and update accounting."""
@@ -264,16 +264,16 @@ class WorkingMemoryManager(WorkingMemoryInterface):
         working memory layer has no knowledge of what the agent did or
         observed — the caller is expected to enrich the episode afterwards.
         """
-        _EXCLUDED = {ContextSource.RETRIEVAL, ContextSource.SUMMARY}
+        excluded_sources = {ContextSource.RETRIEVAL, ContextSource.SUMMARY}
         context_text = "\n\n".join(
             b.content
             for b in self._state.active_context
-            if b.source not in _EXCLUDED
+            if b.source not in excluded_sources
         )
         episode = Episode(
             agent_id="mnemon",
             session_id=self._state.session_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             context=context_text or "(empty)",
             action="",
             outcome="",

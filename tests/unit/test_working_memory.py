@@ -15,7 +15,6 @@ from mnemon.core.models import ContextBlock, ContextSource, Goal, RetrievedItem
 from mnemon.memory.working import WorkingMemoryManager
 from tests.unit.conftest import FakeLLMProvider
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

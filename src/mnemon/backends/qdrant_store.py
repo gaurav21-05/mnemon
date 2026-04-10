@@ -24,15 +24,16 @@ Lifecycle
 from __future__ import annotations
 
 import logging
-import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from qdrant_client import AsyncQdrantClient, models
 
-from mnemon.core.config import MnemonConfig
 from mnemon.core.exceptions import MemoryError, RetrievalError
 from mnemon.core.interfaces import VectorItem, VectorSearchResult, VectorStore
+
+if TYPE_CHECKING:
+    from mnemon.core.config import MnemonConfig
 
 __all__ = ["QdrantVectorStore"]
 

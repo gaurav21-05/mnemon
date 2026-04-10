@@ -12,7 +12,7 @@ level, queuing uncertain actions for explicit user approval.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -31,7 +31,7 @@ class ProposedAction(BaseModel):
     risk_level: RiskLevel
     source: str = Field(description="Module that proposed this action.")
     context: dict[str, Any] = Field(default_factory=dict)
-    proposed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    proposed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     approved: bool | None = None  # None = pending, True = approved, False = denied
 
 

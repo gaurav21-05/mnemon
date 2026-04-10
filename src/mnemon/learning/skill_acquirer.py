@@ -14,27 +14,28 @@ patterns while weakening failures.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from mnemon.core.config import ProceduralConfig
-from mnemon.core.interfaces import (
-    EmbeddingProvider,
-    EpisodicMemoryInterface,
-    LLMProvider,
-    ProceduralMemoryInterface,
-)
 from mnemon.core.models import (
     Condition,
     ConditionType,
     Episode,
-    ParameterSchema,
     Skill,
     SkillStatus,
     SkillType,
 )
+
+if TYPE_CHECKING:
+    from mnemon.core.config import ProceduralConfig
+    from mnemon.core.interfaces import (
+        EmbeddingProvider,
+        EpisodicMemoryInterface,
+        LLMProvider,
+        ProceduralMemoryInterface,
+    )
 
 logger = logging.getLogger(__name__)
 

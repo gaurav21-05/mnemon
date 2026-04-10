@@ -13,10 +13,10 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from mnemon.core.config import RewardConfig, RewardSourceWeights
 from mnemon.learning.reward import RewardProcessor
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -100,7 +100,7 @@ async def test_compute_rpe_signal_is_frozen() -> None:
     """RewardSignal should be immutable (frozen Pydantic model)."""
     proc = _make_processor()
     signal = await proc.compute_rpe(uuid4(), predicted_value=0.0, actual_reward=1.0)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         signal.rpe = 99.0  # type: ignore[misc]
 
 

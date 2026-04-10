@@ -24,11 +24,12 @@ _last_fetched to skip sources that were recently read.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import anyio
@@ -144,7 +145,7 @@ class WebLearningObserver(ObserverPlugin):
         sources: list[WebSource] | None = None,
         poll_interval_s: float = 60.0,
     ) -> None:
-        self._sources: list[WebSource] = sources if sources is not None else _default_sources()
+        self._sources: list[WebSource] = sources if sources is not None else []
         self._poll_interval_s = poll_interval_s
         self._brain: Any = None
         self._running = False
@@ -229,7 +230,10 @@ class WebLearningObserver(ObserverPlugin):
                 await self._ingest_text(content, source_name=source.name or source.url)
                 ingested += 1
             except Exception:
-                logger.exception("WebLearningObserver: ingest failed for article '%s'", article["title"][:60])
+                logger.exception(
+                    "WebLearningObserver: ingest failed for article '%s'",
+                    article["title"][:60],
+                )
 
         logger.info(
             "WebLearningObserver: ingested %d/%d articles from %s",
@@ -242,11 +246,12 @@ class WebLearningObserver(ObserverPlugin):
         labeled = f"[web:{source_name}] {text}"
 
         # Process through sensory buffer (generates embedding, NER, etc.)
-        percept = await self._brain.memory.sensory.process(labeled)
+        await self._brain.memory.sensory.process(labeled)
 
         # Encode directly as an episode — importance=0.4 (moderate, not user-level)
-        from mnemon.core.models import Episode
         import uuid
+
+        from mnemon.core.models import Episode
 
         episode = Episode(
             agent_id="web_learner",
@@ -259,10 +264,8 @@ class WebLearningObserver(ObserverPlugin):
         ep_id = await self._brain.memory.episodic.encode(episode)
 
         # Push to replay buffer so idle consolidation picks it up
-        try:
+        with contextlib.suppress(Exception):
             self._brain.learning.replay_buffer.add(ep_id, priority=episode.importance)
-        except Exception:
-            pass  # replay buffer not critical
 
         logger.debug("Ingested episode %s from %s", ep_id, source_name)
 

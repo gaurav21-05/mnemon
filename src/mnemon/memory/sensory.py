@@ -13,11 +13,14 @@ from __future__ import annotations
 import logging
 import re
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-from mnemon.core.config import SensoryConfig
 from mnemon.core.interfaces import SensoryBufferInterface
 from mnemon.core.models import Entity, Modality, PerceptUnit
+
+if TYPE_CHECKING:
+    from mnemon.core.config import SensoryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ class SensoryBuffer(SensoryBufferInterface):
 
     def _now_ms(self) -> float:
         """Current time as milliseconds since epoch."""
-        return datetime.now(timezone.utc).timestamp() * 1_000
+        return datetime.now(UTC).timestamp() * 1_000
 
     def _is_expired(self, percept: PerceptUnit) -> bool:
         """Return True if *percept* has exceeded its TTL."""

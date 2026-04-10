@@ -89,7 +89,7 @@ class JarvisWorkspace:
         timed_out = False
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             timed_out = True
             process.kill()
             stdout, stderr = await process.communicate()
@@ -111,7 +111,10 @@ class JarvisWorkspace:
             raise NotADirectoryError(f"Not a directory: {target}")
 
         entries: list[dict[str, Any]] = []
-        for child in sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+        for child in sorted(
+            target.iterdir(),
+            key=lambda item: (not item.is_dir(), item.name.lower()),
+        ):
             try:
                 stat = child.stat()
                 entry_type = "dir" if child.is_dir() else "file"
@@ -125,7 +128,11 @@ class JarvisWorkspace:
                 )
             except OSError:
                 continue
-        return {"root": str(self._root), "path": self._relative_to_known_root(target), "entries": entries}
+        return {
+            "root": str(self._root),
+            "path": self._relative_to_known_root(target),
+            "entries": entries,
+        }
 
     async def read_file(self, path: str) -> dict[str, Any]:
         target = self._resolve(path)
@@ -183,7 +190,11 @@ class JarvisWorkspace:
         if occurrences > 1 and not replace_all:
             raise ValueError("search text appears multiple times; set replace_all=True")
 
-        updated = original.replace(search, replace) if replace_all else original.replace(search, replace, 1)
+        updated = (
+            original.replace(search, replace)
+            if replace_all
+            else original.replace(search, replace, 1)
+        )
         target.write_text(updated, encoding="utf-8")
         diff = "".join(
             difflib.unified_diff(

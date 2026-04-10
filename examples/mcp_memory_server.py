@@ -15,7 +15,9 @@ from typing import Any
 from mnemon.services import (
     MemoryService,
     episodes_resource_uri,
+    facts_resource_uri,
     known_resource_uris,
+    profile_resource_uri,
     qualify_tool_name,
     read_resource,
     state_resource_uri,
@@ -24,9 +26,7 @@ from mnemon.services import (
 try:
     from mcp.server.fastmcp import FastMCP
 except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "Missing MCP dependency. Install with: pip install 'mnemon[mcp]'"
-    ) from exc
+    raise SystemExit("Missing MCP dependency. Install with: pip install 'mnemon[mcp]'") from exc
 
 
 mcp = FastMCP("mnemon-memory")
@@ -76,6 +76,45 @@ async def memory_retrieve(
     """Retrieve episodic and semantic memory relevant to a query."""
     service = await _get_service()
     return await service.retrieve_memory(query=query, top_k=top_k, min_score=min_score)
+
+
+@mcp.tool(name=qualify_tool_name(_namespace, "memory_profile_recall"))
+async def memory_profile_recall(
+    query: str,
+    top_k: int = 5,
+    scope_type: str = "all",
+    scope_id: str | None = None,
+) -> dict[str, Any]:
+    """Retrieve scoped memories alongside current and historical profile facts."""
+    service = await _get_service()
+    return await service.profile_recall(
+        query=query,
+        top_k=top_k,
+        scope_type=scope_type,
+        scope_id=scope_id,
+    )
+
+
+@mcp.tool(name=qualify_tool_name(_namespace, "memory_explain_fact"))
+async def memory_explain_fact(triple_id: str) -> dict[str, Any]:
+    """Explain one semantic fact by tracing it back to source episodes."""
+    service = await _get_service()
+    return await service.explain_fact(triple_id)
+
+
+@mcp.tool(name=qualify_tool_name(_namespace, "memory_causal_trace"))
+async def memory_causal_trace(
+    episode_id: str | None = None,
+    outcome_query: str | None = None,
+    max_depth: int = 10,
+) -> dict[str, Any]:
+    """Trace the causal episode chain behind a memory or outcome query."""
+    service = await _get_service()
+    return await service.causal_trace(
+        episode_id=episode_id,
+        outcome_query=outcome_query,
+        max_depth=max_depth,
+    )
 
 
 @mcp.tool(name=qualify_tool_name(_namespace, "memory_consolidate"))
@@ -130,6 +169,18 @@ def _register_resources_if_supported() -> None:
     async def _resource_recent_episodes() -> str:
         service = await _get_service()
         payload = await read_resource(service, _namespace, episodes_resource_uri(_namespace))
+        return str(payload["text"])
+
+    @resource_decorator(facts_resource_uri(_namespace))
+    async def _resource_recent_facts() -> str:
+        service = await _get_service()
+        payload = await read_resource(service, _namespace, facts_resource_uri(_namespace))
+        return str(payload["text"])
+
+    @resource_decorator(profile_resource_uri(_namespace))
+    async def _resource_profile() -> str:
+        service = await _get_service()
+        payload = await read_resource(service, _namespace, profile_resource_uri(_namespace))
         return str(payload["text"])
 
 

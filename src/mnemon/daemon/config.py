@@ -70,11 +70,15 @@ class IdleLoopConfig(BaseSettings):
     )
     # Priority 1: Goal/task thinking — where is master stuck, what to do next
     help_master_weight: float = Field(
-        default=0.4, ge=0.0, description="Relative probability of goal-directed thinking toward master's needs."
+        default=0.4,
+        ge=0.0,
+        description="Relative probability of goal-directed thinking toward master's needs.",
     )
     # Priority 2: Understanding the master as a person
     know_master_weight: float = Field(
-        default=0.25, ge=0.0, description="Relative probability of deepening understanding of the master."
+        default=0.25,
+        ge=0.0,
+        description="Relative probability of deepening understanding of the master.",
     )
     # Priority 3: Self-development — who am I, what have I learned
     grow_weight: float = Field(
@@ -125,8 +129,8 @@ class ObserverConfig(BaseSettings):
         default=300, ge=30, description="Seconds between time-awareness percepts."
     )
     web_learning_enabled: bool = Field(
-        default=True,
-        description="Enable automatic web content ingestion.",
+        default=False,
+        description="Enable configured web content ingestion. Default is off to avoid noise.",
     )
     web_learning_sources: list[WebSourceConfig] = Field(
         default_factory=list,
@@ -134,7 +138,9 @@ class ObserverConfig(BaseSettings):
     )
     web_learning_use_defaults: bool = Field(
         default=False,
-        description="Include built-in starter sources (HN, arXiv, O'Reilly).",
+        description=(
+            "Include built-in starter sources. Off by default; random feeds pollute memory."
+        ),
     )
 
 
@@ -195,7 +201,10 @@ class DaemonConfig(BaseSettings):
     )
     git_journal_enabled: bool = Field(
         default=True,
-        description="Commit identity files (soul.md, master.md, learnings.md) and state to a local git repo.",
+        description=(
+            "Commit identity files (soul.md, master.md, learnings.md) "
+            "and state to a local git repo."
+        ),
     )
     git_journal_interval_s: int = Field(
         default=600, ge=60,
@@ -207,7 +216,10 @@ class DaemonConfig(BaseSettings):
     )
     webui_host: str = Field(
         default="0.0.0.0",
-        description="Host to bind the web UI — 0.0.0.0 makes it reachable on LAN (e.g. from phone).",
+        description=(
+            "Host to bind the web UI — 0.0.0.0 makes it reachable on LAN "
+            "(e.g. from phone)."
+        ),
     )
     webui_port: int = Field(
         default=7777, ge=1024, le=65535,

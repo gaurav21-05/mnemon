@@ -24,14 +24,17 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
-from mnemon.core.config import MnemonConfig
 from mnemon.core.exceptions import ConfigError, MemoryError
 from mnemon.core.interfaces import DocumentStore
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from mnemon.core.config import MnemonConfig
 
 __all__ = ["SQLiteDocumentStore"]
 

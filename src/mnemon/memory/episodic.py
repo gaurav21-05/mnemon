@@ -28,11 +28,9 @@ from __future__ import annotations
 import logging
 import math
 import time
-from datetime import datetime, timezone
-from typing import Any
-from uuid import UUID
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
-from mnemon.core.config import EpisodicConfig
 from mnemon.core.exceptions import MemoryError, RetrievalError
 from mnemon.core.interfaces import (
     DocumentStore,
@@ -43,10 +41,16 @@ from mnemon.core.interfaces import (
 from mnemon.core.models import (
     ConsolidationState,
     Episode,
+    MemoryLifecycleState,
     RetrievalQuery,
     RetrievalResult,
     RetrievedItem,
 )
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from mnemon.core.config import EpisodicConfig
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +88,7 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
         self._vector_store = vector_store
         self._document_store = document_store
         self._embedding_provider = embedding_provider
-        logger.info(
-            "EpisodicMemoryStore initialised backend=%s", config.backend
-        )
+        logger.info("EpisodicMemoryStore initialised backend=%s", config.backend)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -95,10 +97,10 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
     @staticmethod
     def _hours_since(dt: datetime) -> float:
         """Return fractional hours elapsed since *dt* (UTC-aware)."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if dt.tzinfo is None:
             # Treat naive datetimes as UTC
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         delta = now - dt
         return delta.total_seconds() / 3600.0
 
@@ -113,7 +115,7 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
         Returns a value in [-1, 1]; returns 0.0 for zero-norm vectors to
         avoid division-by-zero on unembedded episodes.
         """
-        dot = sum(x * y for x, y in zip(a, b))
+        dot = sum(x * y for x, y in zip(a, b, strict=False))
         norm_a = math.sqrt(sum(x * x for x in a))
         norm_b = math.sqrt(sum(y * y for y in b))
         if norm_a == 0.0 or norm_b == 0.0:
@@ -193,11 +195,15 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
                 # Diversity penalty: maximum similarity to any already-selected
                 # episode.  On the first iteration S is empty so penalty is 0.
                 if selected and emb is not None:
-                    max_sim = max(
-                        EpisodicMemoryStore._cosine_similarity(emb, sel_ep.embedding)
-                        for _, sel_ep in selected
-                        if sel_ep.embedding is not None
-                    ) if any(sel_ep.embedding is not None for _, sel_ep in selected) else 0.0
+                    max_sim = (
+                        max(
+                            EpisodicMemoryStore._cosine_similarity(emb, sel_ep.embedding)
+                            for _, sel_ep in selected
+                            if sel_ep.embedding is not None
+                        )
+                        if any(sel_ep.embedding is not None for _, sel_ep in selected)
+                        else 0.0
+                    )
                 else:
                     max_sim = 0.0
 
@@ -225,6 +231,18 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
             "importance": episode.importance,
             "consolidation_state": episode.consolidation_state,
             "tags": episode.tags,
+            "scope_type": episode.scope_type,
+            "scope_id": episode.scope_id,
+            "workspace_path": episode.workspace_path,
+            "repo_name": episode.repo_name,
+            "caused_by": str(episode.caused_by) if episode.caused_by else None,
+            "led_to": [str(item) for item in episode.led_to],
+            "source_episode_ids": [str(item) for item in episode.source_episode_ids],
+            "summary_kind": episode.summary_kind,
+            "summary_of_count": episode.summary_of_count,
+            "lifecycle_state": episode.lifecycle_state,
+            "retrieval_uses": episode.retrieval_uses,
+            "retrieval_help_count": episode.retrieval_help_count,
         }
 
     def _compute_hybrid_score(
@@ -239,14 +257,25 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
               + w_importance * episode.importance
         """
         weights = self._config.retrieval_weights
-        decay_lambda = self._config.decay.base_lambda
+        decay_lambda = max(episode.decay_lambda, self._config.decay.base_lambda)
         hours = self._hours_since(episode.last_accessed)
         recency_score = math.exp(-decay_lambda * hours)
+        help_ratio = (
+            episode.retrieval_help_count / episode.retrieval_uses
+            if episode.retrieval_uses > 0
+            else 0.0
+        )
+        usefulness_bonus = min(
+            0.12,
+            0.04 * episode.retrieval_help_count + 0.08 * help_ratio,
+        )
 
+        semantic_score = max(0.0, vector_score)
         return (
-            weights.semantic * vector_score
+            weights.semantic * semantic_score
             + weights.recency * recency_score
             + weights.importance * episode.importance
+            + usefulness_bonus
         )
 
     # ------------------------------------------------------------------
@@ -281,9 +310,7 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
 
             metadata = self._build_vector_metadata(episode)
             await self._vector_store.insert(episode.id, embedding, metadata)
-            await self._document_store.put(
-                episode.id, episode.model_dump(mode="json")
-            )
+            await self._document_store.put(episode.id, episode.model_dump(mode="json"))
 
             logger.debug(
                 "EpisodicMemory.encode id=%s agent=%s session=%s",
@@ -346,9 +373,10 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
             try:
                 episode = Episode.model_validate(raw_doc)
             except Exception as exc:
-                logger.warning(
-                    "EpisodicMemory: failed to parse episode %s: %s", candidate.id, exc
-                )
+                logger.warning("EpisodicMemory: failed to parse episode %s: %s", candidate.id, exc)
+                continue
+
+            if episode.lifecycle_state == MemoryLifecycleState.FORGOTTEN:
                 continue
 
             # Apply time_range filter
@@ -356,7 +384,7 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
                 start, end = query.time_range
                 ts = episode.timestamp
                 if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
+                    ts = ts.replace(tzinfo=UTC)
                 if not (start <= ts <= end):
                     continue
 
@@ -384,12 +412,18 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
             top_items = scored_items[: query.top_k]
 
         # Update access metadata for retrieved episodes
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = datetime.now(UTC).isoformat()
         retrieved_items: list[RetrievedItem] = []
         for hybrid_score, episode in top_items:
             updated_doc = episode.model_dump(mode="json")
             updated_doc["last_accessed"] = now_iso
             updated_doc["access_count"] = episode.access_count + 1
+            updated_doc["retrieval_uses"] = episode.retrieval_uses + 1
+            updated_doc["retrieval_last_used_at"] = now_iso
+            updated_doc["base_strength"] = min(
+                episode.base_strength + 0.05 + min(0.15, episode.access_count * 0.01),
+                3.0,
+            )
             await self._document_store.put(episode.id, updated_doc)
 
             retrieved_items.append(
@@ -404,6 +438,15 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
                         "timestamp": episode.timestamp.isoformat(),
                         "importance": episode.importance,
                         "tags": episode.tags,
+                        "scope_type": episode.scope_type,
+                        "scope_id": episode.scope_id,
+                        "workspace_path": episode.workspace_path,
+                        "repo_name": episode.repo_name,
+                        "caused_by": str(episode.caused_by) if episode.caused_by else None,
+                        "led_to": [str(item) for item in episode.led_to],
+                        "source_episode_ids": [str(item) for item in episode.source_episode_ids],
+                        "summary_kind": episode.summary_kind,
+                        "summary_of_count": episode.summary_of_count,
                     },
                 )
             )
@@ -433,9 +476,7 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
         try:
             return Episode.model_validate(raw_doc)
         except Exception as exc:
-            logger.error(
-                "EpisodicMemory.get: failed to parse episode %s: %s", episode_id, exc
-            )
+            logger.error("EpisodicMemory.get: failed to parse episode %s: %s", episode_id, exc)
             return None
 
     async def update(self, episode_id: UUID, **updates: Any) -> None:
@@ -456,9 +497,7 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
         try:
             episode = Episode.model_validate(raw_doc)
         except Exception as exc:
-            raise MemoryError(
-                f"Failed to parse episode {episode_id} for update: {exc}"
-            ) from exc
+            raise MemoryError(f"Failed to parse episode {episode_id} for update: {exc}") from exc
 
         embedding_fields = {"context", "action", "outcome"}
         needs_reembed = any(k in updates for k in embedding_fields)
@@ -471,13 +510,9 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
             updated_episode = updated_episode.model_copy(update={"embedding": new_embedding})
             metadata = self._build_vector_metadata(updated_episode)
             await self._vector_store.update(episode_id, new_embedding, metadata)
-            logger.debug(
-                "EpisodicMemory.update id=%s re-embedded due to field change", episode_id
-            )
+            logger.debug("EpisodicMemory.update id=%s re-embedded due to field change", episode_id)
 
-        await self._document_store.put(
-            episode_id, updated_episode.model_dump(mode="json")
-        )
+        await self._document_store.put(episode_id, updated_episode.model_dump(mode="json"))
         logger.debug("EpisodicMemory.update id=%s fields=%s", episode_id, list(updates.keys()))
 
     async def sample_for_consolidation(self, batch_size: int = 32) -> list[Episode]:
@@ -506,8 +541,12 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
 
         def _priority(ep: Episode) -> float:
             hours = self._hours_since(ep.last_accessed)
-            recency = math.exp(-self._config.decay.base_lambda * hours)
-            return ep.importance * recency
+            recency = math.exp(-max(ep.decay_lambda, self._config.decay.base_lambda) * hours)
+            help_ratio = (
+                ep.retrieval_help_count / ep.retrieval_uses if ep.retrieval_uses > 0 else 0.0
+            )
+            usefulness_factor = 1.0 + min(0.25, 0.05 * ep.retrieval_help_count + 0.1 * help_ratio)
+            return ep.importance * recency * usefulness_factor
 
         episodes.sort(key=_priority, reverse=True)
         sampled = episodes[:batch_size]
@@ -532,11 +571,10 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
                 )
                 continue
             raw_doc["consolidation_state"] = ConsolidationState.CONSOLIDATED
+            raw_doc["lifecycle_state"] = MemoryLifecycleState.CONSOLIDATED
             await self._document_store.put(episode_id, raw_doc)
 
-        logger.debug(
-            "EpisodicMemory.mark_consolidated count=%d", len(episode_ids)
-        )
+        logger.debug("EpisodicMemory.mark_consolidated count=%d", len(episode_ids))
 
     async def run_decay_sweep(self) -> int:
         """Delete stale, already-consolidated episodes whose strength has fallen below threshold.
@@ -551,11 +589,11 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
         Returns
         -------
         int
-            Number of episodes deleted during this sweep.
+            Number of episodes transitioned toward archival/forgetting.
         """
         all_docs = await self._document_store.query(filters={}, limit=1_000_000)
         forget_threshold = self._config.decay.forget_threshold
-        deleted_count = 0
+        changed_count = 0
 
         for doc in all_docs:
             try:
@@ -564,26 +602,45 @@ class EpisodicMemoryStore(EpisodicMemoryInterface):
                 logger.warning("run_decay_sweep: skipping malformed episode doc: %s", exc)
                 continue
 
-            if episode.consolidation_state != ConsolidationState.CONSOLIDATED:
+            if episode.lifecycle_state == MemoryLifecycleState.FORGOTTEN:
+                continue
+            if episode.consolidation_state not in {
+                ConsolidationState.CONSOLIDATED,
+                ConsolidationState.ARCHIVED,
+            }:
                 continue
 
             hours = self._hours_since(episode.last_accessed)
             strength = episode.base_strength * math.exp(-episode.decay_lambda * hours)
 
             if strength < forget_threshold:
-                await self._document_store.delete(episode.id)
-                await self._vector_store.delete(episode.id)
-                deleted_count += 1
-                logger.debug(
-                    "run_decay_sweep: deleted episode %s strength=%.4f threshold=%.4f",
-                    episode.id,
-                    strength,
-                    forget_threshold,
-                )
+                if episode.lifecycle_state == MemoryLifecycleState.ARCHIVED:
+                    doc["lifecycle_state"] = MemoryLifecycleState.FORGOTTEN
+                    doc["consolidation_state"] = ConsolidationState.ARCHIVED
+                    await self._document_store.put(episode.id, doc)
+                    changed_count += 1
+                    logger.debug(
+                        "run_decay_sweep: forgot archived episode %s strength=%.4f threshold=%.4f",
+                        episode.id,
+                        strength,
+                        forget_threshold,
+                    )
+                else:
+                    doc["lifecycle_state"] = MemoryLifecycleState.ARCHIVED
+                    doc["consolidation_state"] = ConsolidationState.ARCHIVED
+                    await self._document_store.put(episode.id, doc)
+                    await self._vector_store.delete(episode.id)
+                    changed_count += 1
+                    logger.debug(
+                        "run_decay_sweep: archived episode %s strength=%.4f threshold=%.4f",
+                        episode.id,
+                        strength,
+                        forget_threshold,
+                    )
 
         logger.info(
-            "EpisodicMemory.run_decay_sweep deleted=%d total_scanned=%d",
-            deleted_count,
+            "EpisodicMemory.run_decay_sweep changed=%d total_scanned=%d",
+            changed_count,
             len(all_docs),
         )
-        return deleted_count
+        return changed_count

@@ -12,10 +12,10 @@ deprecate low-value skills and amplify reliable ones.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
-from mnemon.core.config import ProceduralConfig
 from mnemon.core.exceptions import MemoryError, RetrievalError
 from mnemon.core.interfaces import (
     DocumentStore,
@@ -24,6 +24,9 @@ from mnemon.core.interfaces import (
     VectorStore,
 )
 from mnemon.core.models import Skill, SkillStatus
+
+if TYPE_CHECKING:
+    from mnemon.core.config import ProceduralConfig
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +245,7 @@ class ProceduralMemoryStore(ProceduralMemoryInterface):
 
             updates: dict = {
                 "utility": new_utility,
-                "last_used": datetime.now(timezone.utc),
+                "last_used": datetime.now(UTC),
             }
 
             if success:

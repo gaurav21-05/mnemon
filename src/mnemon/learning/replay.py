@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import random
 from typing import Any
-from uuid import UUID
+from uuid import UUID  # noqa: TC003
 
 from pydantic import BaseModel
 
@@ -125,6 +125,17 @@ class SumTree:
         idx = self._retrieve(0, value)
         data_index = idx - (self._capacity - 1)
         return idx, self._tree[idx], self._data[data_index]
+
+    def active_leaves(self) -> list[tuple[int, float, Any]]:
+        """Return active leaf entries as ``(tree_index, priority, data)`` tuples."""
+        leaf_start = self._capacity - 1
+        leaves: list[tuple[int, float, Any]] = []
+        for data_index, data in enumerate(self._data):
+            tree_index = leaf_start + data_index
+            priority = self._tree[tree_index]
+            if data is not None and priority > 0.0:
+                leaves.append((tree_index, priority, data))
+        return leaves
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -240,10 +251,13 @@ class PrioritizedReplayBuffer:
 
         n = self._tree.size
         effective_batch = min(batch_size, n)
+        active_leaves = self._tree.active_leaves()
+        if effective_batch >= n:
+            return self._experiences_with_weights(active_leaves, total, n)
+
         segment = total / effective_batch
 
-        experiences: list[ReplayExperience] = []
-        priorities: list[float] = []
+        sampled: list[tuple[int, float, Any]] = []
 
         for i in range(effective_batch):
             low = segment * i
@@ -256,35 +270,55 @@ class PrioritizedReplayBuffer:
             if episode_id is None:
                 logger.warning("sample: None episode_id at tree_index=%d", tree_index)
                 continue
+            sampled.append((tree_index, priority, episode_id))
+
+        weighted = self._experiences_with_weights(sampled, total, n)
+        if not weighted:
+            logger.warning("sample: all sampled leaves were uninitialised — returning empty")
+            return []
+        return weighted
+
+    def _experiences_with_weights(
+        self,
+        sampled: list[tuple[int, float, Any]],
+        total: float,
+        population_size: int,
+    ) -> list[ReplayExperience]:
+        """Build validated replay experiences and normalised IS weights."""
+        experiences: list[ReplayExperience] = []
+        priorities: list[float] = []
+
+        for tree_index, priority, episode_id in sampled:
             try:
                 experiences.append(
                     ReplayExperience(
                         episode_id=episode_id,
                         tree_index=tree_index,
                         priority=priority,
-                        is_weight=0.0,  # filled in below
+                        is_weight=0.0,
                     )
                 )
             except Exception:
                 logger.warning(
                     "sample: ReplayExperience rejected episode_id=%r type=%s tree_index=%d",
-                    episode_id, type(episode_id).__name__, tree_index,
+                    episode_id,
+                    type(episode_id).__name__,
+                    tree_index,
                 )
                 continue
             priorities.append(priority)
 
         if not experiences:
-            logger.warning("sample: all sampled leaves were uninitialised — returning empty")
             return []
 
         # Compute IS weights: w_i = (1/(N*P(i)))^beta, normalised by max weight
         min_prob = min(p / total for p in priorities)
-        max_weight = (1.0 / (n * min_prob)) ** self._beta
+        max_weight = (1.0 / (population_size * min_prob)) ** self._beta
 
         weighted: list[ReplayExperience] = []
-        for exp, p in zip(experiences, priorities):
+        for exp, p in zip(experiences, priorities, strict=False):
             prob = p / total
-            weight = (1.0 / (n * prob)) ** self._beta / max_weight
+            weight = (1.0 / (population_size * prob)) ** self._beta / max_weight
             weighted.append(
                 ReplayExperience(
                     episode_id=exp.episode_id,
@@ -316,7 +350,7 @@ class PrioritizedReplayBuffer:
                 f"tree_indices and new_priorities must have the same length, "
                 f"got {len(tree_indices)} vs {len(new_priorities)}"
             )
-        for idx, p in zip(tree_indices, new_priorities):
+        for idx, p in zip(tree_indices, new_priorities, strict=False):
             scaled = (abs(p) + self._EPSILON) ** self._alpha
             self._tree.update(idx, scaled)
         logger.debug("Updated %d priorities", len(tree_indices))

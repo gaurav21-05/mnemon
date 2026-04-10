@@ -64,6 +64,58 @@ anyio.run(main)
 
 ## Interactive examples
 
+### Simple interactive CLI
+
+This is the easiest way to boot the Mnemon memory system and start chatting with it.
+
+```bash
+# Installed entrypoint
+mnemon
+
+# Start the daemon-oriented experience in one command
+mnemon start
+
+# First-time local setup (creates ~/.local/bin launchers)
+./scripts/install-local-cli.sh
+
+# Or module mode
+python3 -m mnemon
+
+# Local Ollama mode
+mnemon --local
+```
+
+Behavior:
+
+- `mnemon` checks your provider setup before booting
+- if no cloud API key is available, it tries local Ollama mode automatically
+- if Ollama is installed but not running, it attempts to start `ollama serve`
+- if Ollama local models are missing, it attempts to pull them with visible progress
+- if required local models are missing, it tells you exactly what to pull
+- `mnemon --doctor` prints a setup diagnosis without starting the system
+
+Useful startup details shown in the CLI:
+
+- active chat model
+- active embedding model
+- Web UI command
+- Web UI URL (`http://localhost:7777`)
+- LAN URL for other devices on your network
+- full daemon command
+- doctor command
+- quick-action footer inside the interactive session
+
+Inside the CLI, use:
+
+- `/memories`
+- `/facts`
+- `/skills`
+- `/state`
+- `/consolidate`
+- `/goals`
+- `/help`
+- `/quit`
+
 ### Agent demo
 
 ```bash
@@ -92,32 +144,54 @@ The daemon layer exposes Mnemon as a long-running assistant with CLI, IPC, and w
 ### Start the daemon
 
 ```bash
-python -m mnemon.daemon.cli.app start --foreground
+mnemon start
+
+# or directly
+mnemon-daemon start --foreground
 ```
 
 In another shell:
 
 ```bash
-python -m mnemon.daemon.cli.app status
-python -m mnemon.daemon.cli.app chat "Remember that I'm working on mnemon"
-python -m mnemon.daemon.cli.app goals add "Ship the daemon bridge example"
-python -m mnemon.daemon.cli.app thoughts --limit 5
+mnemon-daemon status
+mnemon-daemon chat "Remember that I'm working on mnemon"
+mnemon-daemon goals add "Ship the daemon bridge example"
+mnemon-daemon thoughts --limit 5
 ```
 
 ### Goal management
 
 ```bash
-python -m mnemon.daemon.cli.app goals add "Write release notes" --priority 0.8
-python -m mnemon.daemon.cli.app goals list
+mnemon-daemon goals add "Write release notes" --priority 0.8
+mnemon-daemon goals list
 ```
 
 ### Workspace tooling through the daemon
 
 ```bash
-python -m mnemon.daemon.cli.app ls src/mnemon/daemon
-python -m mnemon.daemon.cli.app read src/mnemon/daemon/ipc.py
-python -m mnemon.daemon.cli.app git-status
-python -m mnemon.daemon.cli.app verify "python -m pytest tests/unit -q"
+mnemon-daemon ls src/mnemon/daemon
+mnemon-daemon read src/mnemon/daemon/ipc.py
+mnemon-daemon git-status
+mnemon-daemon verify "python -m pytest tests/unit -q"
+```
+
+### Memory profile + progressive recall
+
+Inspired by tools like Supermemory and Claude-Mem, Mnemon now exposes a compact
+profile-and-recall workflow through the daemon:
+
+```bash
+# Compact indexed search with IDs, timestamps, tags, and profile hints
+mnemon-daemon memory search "what am I currently working on?"
+
+# Expand one or more exact memory hits
+mnemon-daemon memory get <episode-id>
+
+# View the structured user profile Mnemon inferred over time
+mnemon-daemon memory profile
+
+# Inspect nearby memories around one anchor event
+mnemon-daemon memory timeline <episode-id>
 ```
 
 ### Supervised self-improvement
@@ -133,17 +207,17 @@ Mnemon can run a guarded self-improvement workflow against its own repo:
 
 ```bash
 # Analysis only
-python -m mnemon.daemon.cli.app improve --analyze
+mnemon-daemon improve --analyze
 
 # Start a run
-python -m mnemon.daemon.cli.app improve "improve code quality and fix any failing tests"
+mnemon-daemon improve "improve code quality and fix any failing tests"
 
 # Poll progress
-python -m mnemon.daemon.cli.app improve --status
+mnemon-daemon improve --status
 
 # Finish or discard once awaiting approval
-python -m mnemon.daemon.cli.app improve --approve
-python -m mnemon.daemon.cli.app improve --abort
+mnemon-daemon improve --approve
+mnemon-daemon improve --abort
 ```
 
 ## Web UI
@@ -151,7 +225,7 @@ python -m mnemon.daemon.cli.app improve --abort
 Run the dashboard as a standalone process:
 
 ```bash
-python -m mnemon.daemon.webui
+mnemon-daemon webui
 ```
 
 Open <http://localhost:7777>.
@@ -199,7 +273,7 @@ Exposed tools:
 Start the daemon first:
 
 ```bash
-python -m mnemon.daemon.cli.app start --foreground
+mnemon-daemon start --foreground
 ```
 
 Then start the MCP bridge:

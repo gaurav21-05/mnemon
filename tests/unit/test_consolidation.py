@@ -22,12 +22,22 @@ pytestmark = pytest.mark.asyncio
 
 
 class FailingExtractionLLM(FakeLLMProvider):
-    async def generate_structured(self, prompt: str, response_schema: dict, **kwargs: object) -> dict:
+    async def generate_structured(
+        self,
+        prompt: str,
+        response_schema: dict,
+        **kwargs: object,
+    ) -> dict:
         raise RuntimeError("Cannot connect to localhost:11434")
 
 
 class EmptyTriplesLLM(FakeLLMProvider):
-    async def generate_structured(self, prompt: str, response_schema: dict, **kwargs: object) -> dict:
+    async def generate_structured(
+        self,
+        prompt: str,
+        response_schema: dict,
+        **kwargs: object,
+    ) -> dict:
         return {"triples": []}
 
 
@@ -116,3 +126,75 @@ async def test_empty_extraction_marks_episode_consolidated(config) -> None:
     assert stored is not None
     assert stored.consolidation_state == ConsolidationState.CONSOLIDATED
     assert stored.consolidation_attempts == 0
+
+
+async def test_repeated_tagged_episodes_create_summary_episode(config) -> None:
+    engine, episodic, replay = _make_engine(config, EmptyTriplesLLM())
+
+    first = Episode(
+        agent_id="test-agent",
+        session_id=uuid4(),
+        context="Reviewed deployment checklist",
+        action="updated deployment notes",
+        outcome="captured a deployment improvement",
+        tags=["deploy"],
+        importance=0.7,
+    )
+    second = Episode(
+        agent_id="test-agent",
+        session_id=uuid4(),
+        context="Validated deployment rollback steps",
+        action="tested rollback commands",
+        outcome="confirmed rollback procedure works",
+        tags=["deploy"],
+        importance=0.8,
+    )
+    await episodic.encode(first)
+    await episodic.encode(second)
+    replay.add(first.id, priority=first.importance)
+    replay.add(second.id, priority=second.importance)
+
+    await engine.run_cycle()
+
+    docs = await episodic._document_store.query(filters={}, limit=100)
+    summary_docs = [doc for doc in docs if int(doc.get("summary_of_count", 0) or 0) >= 2]
+    assert len(summary_docs) == 1
+    assert summary_docs[0]["summary_kind"] == "episodic_cluster"
+    assert sorted(summary_docs[0]["source_episode_ids"]) == sorted([str(first.id), str(second.id)])
+
+
+async def test_repeated_tagged_episodes_preserve_shared_goal_id_in_summary(config) -> None:
+    engine, episodic, replay = _make_engine(config, EmptyTriplesLLM())
+    goal_id = uuid4()
+
+    first = Episode(
+        agent_id="test-agent",
+        session_id=uuid4(),
+        context="Reviewed deployment checklist",
+        action="updated deployment notes",
+        outcome="captured a deployment improvement",
+        tags=["deploy"],
+        importance=0.7,
+        goal_id=goal_id,
+    )
+    second = Episode(
+        agent_id="test-agent",
+        session_id=uuid4(),
+        context="Validated deployment rollback steps",
+        action="tested rollback commands",
+        outcome="confirmed rollback procedure works",
+        tags=["deploy"],
+        importance=0.8,
+        goal_id=goal_id,
+    )
+    await episodic.encode(first)
+    await episodic.encode(second)
+    replay.add(first.id, priority=first.importance)
+    replay.add(second.id, priority=second.importance)
+
+    await engine.run_cycle()
+
+    docs = await episodic._document_store.query(filters={}, limit=100)
+    summary_docs = [doc for doc in docs if int(doc.get("summary_of_count", 0) or 0) >= 2]
+    assert len(summary_docs) == 1
+    assert summary_docs[0]["goal_id"] == str(goal_id)

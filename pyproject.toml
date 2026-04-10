@@ -51,6 +51,10 @@ all = [
     "apscheduler", "mcp",
 ]
 
+[tool.poetry.scripts]
+mnemon = "mnemon.cli:main"
+mnemon-daemon = "mnemon.daemon.cli.app:main"
+
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2"
 pytest-asyncio = "^0.23"

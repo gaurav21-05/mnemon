@@ -28,9 +28,12 @@ Config via environment:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import os
-from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -183,10 +186,8 @@ class JarvisTelegramBot:
 
         # Mark all as read via IPC
         if unread:
-            try:
+            with contextlib.suppress(Exception):
                 await client._rpc("inbox.mark_read", {})
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------
     # Command handlers
@@ -308,13 +309,19 @@ class JarvisTelegramBot:
         if not query:
             await update.message.reply_text("Usage: /browse <what to search for>")
             return
-        await update.message.reply_text(f"🌐 Browsing: {query}\n_(this may take up to 2 minutes)_", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🌐 Browsing: {query}\n_(this may take up to 2 minutes)_",
+            parse_mode="Markdown",
+        )
         try:
             from mnemon.daemon.cli.client import DaemonClient
             client = DaemonClient(self._socket_path)
             result = await client.browse(query)
             text = result.get("result", "(no result)")[:3500]
-            await update.message.reply_text(f"🌐 *Research result:*\n\n{text}", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"🌐 *Research result:*\n\n{text}",
+                parse_mode="Markdown",
+            )
         except Exception as exc:
             await update.message.reply_text(f"Browse failed: {exc}")
 

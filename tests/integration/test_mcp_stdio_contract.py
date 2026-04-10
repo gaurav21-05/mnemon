@@ -144,11 +144,12 @@ def test_mcp_stdio_jsonrpc_contract() -> None:
 
         tools = client.request("tools/list", {})
         assert tools.get("error") is None
-        tool_names = {
-            t["name"] for t in tools.get("result", {}).get("tools", []) if "name" in t
-        }
+        tool_names = {t["name"] for t in tools.get("result", {}).get("tools", []) if "name" in t}
         assert "mnemon_test.memory_state" in tool_names
         assert "mnemon_test.memory_resources_list" in tool_names
+        assert "mnemon_test.memory_profile_recall" in tool_names
+        assert "mnemon_test.memory_explain_fact" in tool_names
+        assert "mnemon_test.memory_causal_trace" in tool_names
 
         state_call = client.request(
             "tools/call",

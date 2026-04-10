@@ -20,29 +20,31 @@ CycleLatencyBenchmark      → Orchestrator cycle latency vs. 500 ms budget
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from mnemon.core.interfaces import (
-    ConsolidationEngineInterface,
-    EpisodicMemoryInterface,
-    OrchestratorInterface,
-    WorkingMemoryInterface,
-)
 from mnemon.core.models import (
     ContextBlock,
-    ContextSource,
     Episode,
     RetrievalQuery,
     SemanticTriple,
 )
+
+if TYPE_CHECKING:
+    from mnemon.core.interfaces import (
+        ConsolidationEngineInterface,
+        EpisodicMemoryInterface,
+        OrchestratorInterface,
+        WorkingMemoryInterface,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +65,7 @@ class BenchmarkResult(BaseModel):
     benchmark_name: str
     metrics: dict[str, float]
     details: dict[str, Any] = Field(default_factory=dict)
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     duration_ms: float
 
 
@@ -174,10 +176,8 @@ class RetrievalBenchmark(Benchmark):
             for item in result.items[:k]:
                 raw_id = item.metadata.get("episode_id") or item.metadata.get("id")
                 if raw_id is not None:
-                    try:
+                    with contextlib.suppress(ValueError, AttributeError):
                         retrieved_ids.append(UUID(str(raw_id)))
-                    except (ValueError, AttributeError):
-                        pass
 
             retrieved_set = set(retrieved_ids)
             tp = len(retrieved_set & expected_set)
@@ -268,7 +268,11 @@ class ConsolidationBenchmark(Benchmark):
         """Canonical (subject_name, predicate, object_name) key for comparison."""
         subj = t.subject.name.strip().lower()
         pred = t.predicate.strip().lower()
-        obj = t.object.name.strip().lower() if hasattr(t.object, "name") else str(t.object).strip().lower()
+        obj = (
+            t.object.name.strip().lower()
+            if hasattr(t.object, "name")
+            else str(t.object).strip().lower()
+        )
         return (subj, pred, obj)
 
     async def run(  # type: ignore[override]
@@ -318,7 +322,8 @@ class ConsolidationBenchmark(Benchmark):
                         replay_buffer.push(ep.id, priority=ep.importance)
                     except Exception as rb_exc:
                         logger.debug(
-                            "ConsolidationBenchmark: failed to push episode %s to replay buffer: %s",
+                            "ConsolidationBenchmark: failed to push episode %s "
+                            "to replay buffer: %s",
                             ep.id,
                             rb_exc,
                         )
@@ -430,7 +435,7 @@ class ForgettingCurveBenchmark(Benchmark):
         # Filter zero retention (ln undefined) and zero delta
         pairs = [
             (t, r)
-            for t, r in zip(time_deltas, retention_rates)
+            for t, r in zip(time_deltas, retention_rates, strict=False)
             if r > 0.0 and t >= 0.0
         ]
         if len(pairs) < 2:
@@ -442,7 +447,7 @@ class ForgettingCurveBenchmark(Benchmark):
         # OLS: slope = cov(x, ln_y) / var(x)
         mean_x = sum(xs) / len(xs)
         mean_ly = sum(log_ys) / len(log_ys)
-        cov = sum((x - mean_x) * (ly - mean_ly) for x, ly in zip(xs, log_ys))
+        cov = sum((x - mean_x) * (ly - mean_ly) for x, ly in zip(xs, log_ys, strict=False))
         var_x = sum((x - mean_x) ** 2 for x in xs)
 
         if abs(var_x) < 1e-12:
@@ -454,7 +459,7 @@ class ForgettingCurveBenchmark(Benchmark):
 
         # R² against the fitted model
         predicted = [math.exp(intercept + slope * x) for x in xs]
-        ss_res = sum((p[1] - pred) ** 2 for p, pred in zip(pairs, predicted))
+        ss_res = sum((p[1] - pred) ** 2 for p, pred in zip(pairs, predicted, strict=False))
         mean_y = sum(p[1] for p in pairs) / len(pairs)
         ss_tot = sum((p[1] - mean_y) ** 2 for p in pairs)
 
@@ -592,7 +597,11 @@ class MemoryInterferenceBenchmark(Benchmark):
         if not retrieved_items_per_query:
             return 0.0
         correct = 0
-        for retrieved, expected in zip(retrieved_items_per_query, expected_ids_per_query):
+        for retrieved, expected in zip(
+            retrieved_items_per_query,
+            expected_ids_per_query,
+            strict=False,
+        ):
             if set(expected).issubset(set(retrieved)):
                 correct += 1
         return correct / len(retrieved_items_per_query)
@@ -612,10 +621,8 @@ class MemoryInterferenceBenchmark(Benchmark):
                 for item in result.items[:k]:
                     raw_id = item.metadata.get("episode_id") or item.metadata.get("id")
                     if raw_id is not None:
-                        try:
+                        with contextlib.suppress(ValueError, AttributeError):
                             ids.append(UUID(str(raw_id)))
-                        except (ValueError, AttributeError):
-                            pass
                 results.append(ids)
             except Exception as exc:
                 logger.warning(
@@ -654,7 +661,9 @@ class MemoryInterferenceBenchmark(Benchmark):
         t_start = self._now_ms()
 
         if not old_queries or not old_expected_ids:
-            raise ValueError("MemoryInterferenceBenchmark requires old_queries and old_expected_ids.")
+            raise ValueError(
+                "MemoryInterferenceBenchmark requires old_queries and old_expected_ids."
+            )
         if len(old_queries) != len(old_expected_ids):
             raise ValueError(
                 "old_queries and old_expected_ids must have the same length."
@@ -890,7 +899,6 @@ class WorkingMemoryBenchmark(Benchmark):
         total_input_tokens = sum(b.token_count for b in blocks)
 
         injected_ids: list[UUID] = []
-        eviction_errors = 0
 
         for block in blocks:
             try:
@@ -1014,7 +1022,11 @@ class ContinualLearningBenchmark(Benchmark):
         if not retrieved_ids_per_query:
             return 0.0
         correct = 0
-        for retrieved, expected in zip(retrieved_ids_per_query, expected_ids_per_query):
+        for retrieved, expected in zip(
+            retrieved_ids_per_query,
+            expected_ids_per_query,
+            strict=False,
+        ):
             if set(expected).issubset(set(retrieved)):
                 correct += 1
         return correct / len(retrieved_ids_per_query)
@@ -1037,10 +1049,8 @@ class ContinualLearningBenchmark(Benchmark):
                 for item in result.items[:k]:
                     raw_id = item.metadata.get("episode_id") or item.metadata.get("id")
                     if raw_id is not None:
-                        try:
+                        with contextlib.suppress(ValueError, AttributeError):
                             ids.append(UUID(str(raw_id)))
-                        except (ValueError, AttributeError):
-                            pass
                 retrieved_per_query.append(ids)
             except Exception as exc:
                 logger.warning(
@@ -1096,7 +1106,7 @@ class ContinualLearningBenchmark(Benchmark):
             [None] * num_tasks for _ in range(num_tasks)
         ]
 
-        for task_idx, (episodes, probes) in enumerate(tasks):
+        for task_idx, (episodes, _probes) in enumerate(tasks):
             # Encode new episodes for this task
             for ep in episodes:
                 try:

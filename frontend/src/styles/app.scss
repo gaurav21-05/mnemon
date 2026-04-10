@@ -1,0 +1,103 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --paper: #f2f1ed;
+  --surface: #f7f7f4;
+  --surface-muted: #ebeae5;
+  --surface-soft: #e6e5e0;
+  --surface-sand: #e1e0db;
+  --border: oklab(0.263084 -0.00230259 0.0124794 / 0.1);
+  --border-strong: oklab(0.263084 -0.00230259 0.0124794 / 0.24);
+  --ink: rgba(38, 37, 30, 0.78);
+  --ink-strong: #26251e;
+  --muted: rgba(38, 37, 30, 0.58);
+  --accent: #f54e00;
+  --accent-strong: #cf2d56;
+  --success: #1f8a65;
+  --danger: #cf2d56;
+  --focus: rgba(38, 37, 30, 0.16);
+  --topbar-bg: rgba(242, 241, 237, 0.88);
+  --text-on-accent: #ffffff;
+  --shadow-card:
+    rgba(0, 0, 0, 0.045) 0 8px 22px,
+    oklab(0.263084 -0.00230259 0.0124794 / 0.1) 0 0 0 1px;
+  --shadow-soft: rgba(0, 0, 0, 0.035) 0 6px 16px;
+  --font-display: "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-sans: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #14120f;
+  --surface: #1f1d18;
+  --surface-muted: #29261f;
+  --surface-soft: #343126;
+  --surface-sand: #403b30;
+  --border: rgba(242, 241, 237, 0.12);
+  --border-strong: rgba(242, 241, 237, 0.26);
+  --ink: rgba(242, 241, 237, 0.82);
+  --ink-strong: #fffaf0;
+  --muted: rgba(242, 241, 237, 0.62);
+  --accent: #ff7a1a;
+  --accent-strong: #ffb071;
+  --success: #5fd29b;
+  --danger: #ff6f91;
+  --focus: rgba(255, 176, 113, 0.35);
+  --topbar-bg: rgba(20, 18, 15, 0.9);
+  --text-on-accent: #1f130a;
+  --shadow-card:
+    rgba(0, 0, 0, 0.28) 0 10px 26px,
+    rgba(242, 241, 237, 0.09) 0 0 0 1px;
+  --shadow-soft: rgba(0, 0, 0, 0.22) 0 8px 18px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  overflow: hidden;
+}
+
+#root {
+  overflow: hidden;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 20% 0%, rgba(245, 78, 0, 0.08), transparent 34%),
+    radial-gradient(circle at 82% 18%, rgba(31, 138, 101, 0.06), transparent 30%);
+}
+
+.react-flow {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+
+.react-flow__controls,
+.react-flow__minimap {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-soft);
+  overflow: hidden;
+}
