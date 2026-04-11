@@ -374,27 +374,6 @@ uv run ruff format src tests examples
 uv run mypy src/mnemon
 ```
 
-## Roadmap
-
-**Bugs / correctness**
-- [x] Consolidation engine: mark episodes as `FAILED` after N LLM extraction retries
-- [x] Semantic store: atomic write between vector index and SQLite `_docs` table
-
-**Self-improvement**
-- [x] `daemon/improve.py` — 6-phase supervised workflow (analyze → plan → worktree → patch → verify → approve/abort)
-- [x] IPC + CLI integration (`improve.analyze`, `improve.start`, `improve.status`, `improve.approve`, `improve.abort`)
-- [ ] Structured planning memory: persist improvement plans across sessions in episodic store
-
-**Interfaces**
-- [x] Web UI: goal creation form
-- [x] Web UI: memory search widget
-- [x] MCP daemon bridge (`examples/mcp_daemon_server.py`)
-
-**Distribution**
-- [ ] PyPI release
-- [ ] Docker image
-- [ ] Homebrew formula (macOS)
-
 ## License
 
 [Apache-2.0](./LICENSE)
