@@ -124,3 +124,56 @@ async def test_write_intent_auto_executes_under_default_semi_auto() -> None:
     assert result is not None
     assert "Pending approval" not in result["reply"]
     assert workspace.writes == [("notes.txt", "hello world", False)]
+
+
+async def test_execution_followup_uses_recent_chat_context() -> None:
+    class _HistoryAwareLLM:
+        async def generate_structured(
+            self,
+            prompt: str,
+            response_schema: dict,
+            **kwargs: object,
+        ) -> dict:
+            del response_schema, kwargs
+            assert "designs" in prompt
+            assert "resume" in prompt
+            assert "single page" in prompt
+            if "Previous tool results:\n(no tool results yet)" not in prompt:
+                return {"action": "respond", "reply": "Built the page."}
+            return {
+                "action": "write",
+                "path": "portfolio/index.html",
+                "content": "<html>built from resume and designs</html>",
+                "append": False,
+            }
+
+    brain = SimpleNamespace(
+        control=SimpleNamespace(goals=SimpleNamespace(_llm=_HistoryAwareLLM())),
+    )
+    server = DaemonIPCServer(
+        socket_path=Path("/tmp/mnemon-test.sock"),
+        brain=brain,
+        state=DaemonState(),
+        autonomy=AutonomyController(DaemonConfig()),
+        idle_loop=_DummyIdleLoop(),
+    )
+    workspace = _FakeWorkspace()
+    server._workspace = workspace
+    server._chat_history.extend(
+        [
+            {"role": "user", "content": "take design from /home/rohit/Downloads/designs"},
+            {"role": "assistant", "content": "I can use that design source."},
+            {"role": "user", "content": "build all sections from my resume"},
+            {"role": "assistant", "content": "I will build all sections from your resume."},
+            {"role": "user", "content": "single page"},
+            {"role": "assistant", "content": "I'll make it a single page site."},
+        ]
+    )
+
+    result = await server._handle_tool_request("start building now")
+
+    assert result is not None
+    assert "Pending approval" not in result["reply"]
+    assert workspace.writes == [
+        ("portfolio/index.html", "<html>built from resume and designs</html>", False)
+    ]

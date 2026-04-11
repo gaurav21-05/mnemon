@@ -135,6 +135,13 @@ _TOOL_ACTION_SCHEMA: dict[str, Any] = {
 }
 
 _AGENTIC_HINTS = (
+    "build",
+    "website",
+    "portfolio",
+    "resume",
+    "design",
+    "html",
+    "css",
     "file",
     "folder",
     "directory",
@@ -164,6 +171,19 @@ _AGENTIC_HINTS = (
 )
 _MAX_AGENT_TOOL_STEPS = 6
 _GOAL_LEAD_VERBS = ("build", "make", "create", "design", "develop", "write", "ship", "start")
+_EXECUTION_FOLLOWUP_PATTERNS = (
+    "start now",
+    "start building",
+    "start building now",
+    "build it",
+    "build now",
+    "go ahead",
+    "do it",
+    "continue",
+    "proceed",
+    "ship it",
+    "start working",
+)
 _PROGRESS_STATUS_PATTERNS = (
     "where are you building",
     "where is this",
@@ -1923,6 +1943,24 @@ class DaemonIPCServer:
         )
         return "\n".join(lines)
 
+    def _recent_chat_context(self, limit: int = 6) -> str:
+        history = list(self._chat_history)[-max(0, limit) :]
+        if not history:
+            return "(none)"
+        return "\n".join(
+            f"{item.get('role', 'unknown')}: {item.get('content', '').strip()}"
+            for item in history
+            if str(item.get("content", "")).strip()
+        ) or "(none)"
+
+    def _should_treat_as_execution_followup(self, message: str) -> bool:
+        lowered = " ".join(message.lower().split())
+        if not lowered:
+            return False
+        if any(pattern in lowered for pattern in _EXECUTION_FOLLOWUP_PATTERNS):
+            return True
+        return lowered in {"start", "build", "continue", "proceed"}
+
     async def _remember_verified_tool_action(
         self,
         *,
@@ -2260,8 +2298,14 @@ class DaemonIPCServer:
         initial_action = (
             browse_hint or self._step_to_action(inferred) if inferred or browse_hint else None
         )
-        if initial_action is None and not _looks_like_agentic_tool_request(message):
-            return None
+        if initial_action is None:
+            has_agentic_signal = _looks_like_agentic_tool_request(message)
+            if not has_agentic_signal and self._should_treat_as_execution_followup(message):
+                has_agentic_signal = bool(self._active_goal_descriptions()) or bool(
+                    self._chat_history
+                )
+            if not has_agentic_signal:
+                return None
         return await self._run_agentic_tool_loop(
             message=message,
             initial_action=initial_action,
@@ -2373,7 +2417,11 @@ class DaemonIPCServer:
             "- Prefer verify after code changes.\n"
             "- For write, provide the full intended file content.\n"
             "- If you already have enough information, choose respond.\n"
+            "- If the latest message is a continuation like 'start now', 'build it', or "
+            "'continue', infer the task from the active goals and recent conversation.\n"
             "- Do not invent tool output.\n\n"
+            f"Active goals:\n{'; '.join(self._active_goal_descriptions()) or '(none)'}\n\n"
+            f"Recent conversation:\n{self._recent_chat_context()}\n\n"
             f"User request:\n{message}\n\n"
             f"Previous tool results:\n{results_text}"
         )
