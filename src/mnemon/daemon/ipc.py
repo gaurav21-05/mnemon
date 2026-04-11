@@ -21,19 +21,19 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import anyio
 import anyio.abc
 from anyio import create_unix_listener
 
-from mnemon.core.models import GoalStatus
+from mnemon.core.models import Episode, GoalStatus
 from mnemon.daemon.autonomy import AutonomyController, ProposedAction
 from mnemon.daemon.capture_policy import classify_interaction
 from mnemon.daemon.config import DaemonConfig, RiskLevel
 from mnemon.daemon.identity import JarvisIdentity, MasterProfile, ProfileFact
 from mnemon.daemon.improve import Phase, SelfImprovementOrchestrator
-from mnemon.daemon.privacy import apply_redactions, load_privacy_rules
+from mnemon.daemon.privacy import apply_redactions, load_privacy_rules, should_exclude_text
 from mnemon.daemon.reports import ReportEngine
 from mnemon.daemon.scenario import ScenarioEngine
 
@@ -163,6 +163,22 @@ _AGENTIC_HINTS = (
     "latest",
 )
 _MAX_AGENT_TOOL_STEPS = 6
+_GOAL_LEAD_VERBS = ("build", "make", "create", "design", "develop", "write", "ship", "start")
+_PROGRESS_STATUS_PATTERNS = (
+    "where are you building",
+    "where is this",
+    "where is it",
+    "where are the files",
+    "where did you put",
+    "what path",
+    "which folder",
+    "where on my local machine",
+    "are you doing",
+    "did you build",
+    "have you built",
+    "have you started",
+    "did you start",
+)
 
 
 def _strip_wrapping_quotes(value: str) -> str:
@@ -414,6 +430,8 @@ HARD RULES — never break these:
 - NEVER invent facts about the user. Do not assume routines, habits, or
   feelings they haven't stated.
 - NEVER pretend you've done something you haven't.
+- NEVER claim browsing, file creation, local paths, project setup, or build progress
+  unless the live state below explicitly says it happened.
 - Ask ONE follow-up question at most. Never fire a list of questions.
 - Keep replies concise. No filler phrases like "Great question!" or "Certainly!".\
 """
@@ -433,6 +451,8 @@ HARD RULES — never break these:
 - NEVER invent observations about the user beyond what's explicitly in the memories above.
   Do not fabricate routines, habits, moods, or behaviors they haven't stated.
 - Use memories naturally — don't announce "I remember you said...". Just use what you know.
+- NEVER claim browsing, file creation, local paths, project setup, or build progress
+  unless the live state below explicitly says it happened.
 - Ask ONE follow-up question at most.
 - Keep replies concise. No padding, no filler.\
 """
@@ -466,6 +486,7 @@ class DaemonIPCServer:
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._scenario_engine: ScenarioEngine | None = None
         self._report_engine: ReportEngine | None = None
+        self._conversation_activity: deque[dict[str, str]] = deque(maxlen=20)
         self._handlers: dict[str, Any] = {
             "chat": self._rpc_chat,
             "status": self._rpc_status,
@@ -1795,6 +1816,164 @@ class DaemonIPCServer:
             return []
         return [str(goal.description) for goal in goals]
 
+    @staticmethod
+    def _normalize_goal_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+    @classmethod
+    def _infer_goal_from_message(cls, message: str) -> str | None:
+        cleaned = " ".join(message.strip().split()).strip(" .!?")
+        if not cleaned:
+            return None
+        pattern = re.compile(
+            r"^(?:please\s+|can you\s+|could you\s+|would you\s+|help me\s+|let's\s+)?"
+            r"(?P<verb>build|make|create|design|develop|write|ship|start)\s+"
+            r"(?P<body>.+)$",
+            flags=re.IGNORECASE,
+        )
+        match = pattern.match(cleaned)
+        if match is None:
+            return None
+        body = re.sub(r"\bfor me\b$", "", match.group("body"), flags=re.IGNORECASE).strip(" .!?")
+        if len(body) < 5:
+            return None
+        verb = match.group("verb").lower()
+        lead = "Ship" if verb == "ship" else "Build"
+        return f"{lead} {body}"
+
+    async def _maybe_create_goal_from_message(self, message: str) -> None:
+        if _infer_workspace_intent(message) is not None:
+            return
+        goal_text = self._infer_goal_from_message(message)
+        if goal_text is None:
+            return
+        try:
+            goal_manager = self._brain.control.goals
+            existing = self._active_goal_descriptions()
+            normalized_goal = self._normalize_goal_text(goal_text)
+            if any(
+                normalized_goal == self._normalize_goal_text(item)
+                or normalized_goal in self._normalize_goal_text(item)
+                or self._normalize_goal_text(item) in normalized_goal
+                for item in existing
+            ):
+                return
+            await goal_manager.create_goal(goal_text, priority=0.75)
+        except Exception:
+            logger.debug("goal auto-capture failed", exc_info=True)
+
+    def _record_conversation_activity(self, kind: str, detail: str) -> None:
+        self._conversation_activity.append({"kind": kind, "detail": detail.strip()})
+
+    def _grounded_progress_reply(self, message: str) -> str | None:
+        lowered = message.lower()
+        if not any(pattern in lowered for pattern in _PROGRESS_STATUS_PATTERNS):
+            return None
+
+        writes = [
+            item
+            for item in self._conversation_activity
+            if item["kind"] in {"write", "patch", "worktree_create", "exec"}
+        ]
+        browses = [item for item in self._conversation_activity if item["kind"] == "browse"]
+        if writes:
+            latest = writes[-1]["detail"]
+            return f"I only have verified local progress where I actually touched `{latest}`."
+        if browses:
+            latest = browses[-1]["detail"]
+            return (
+                "I haven't created anything locally yet. "
+                f"So far I only researched `{latest}`."
+            )
+        return (
+            "I haven't created files or started building this locally yet. "
+            "So far we've only discussed the direction, and I don't have a verified local path."
+        )
+
+    def _conversation_state_block(self) -> str:
+        goals = self._active_goal_descriptions()
+        workspace_root = str(self._get_workspace().root)
+        lines = [f"- Workspace root: {workspace_root}"]
+        if goals:
+            lines.append(f"- Active goals: {'; '.join(goals[:3])}")
+        else:
+            lines.append("- Active goals: none")
+
+        writes = [
+            item["detail"]
+            for item in self._conversation_activity
+            if item["kind"] in {"write", "patch", "worktree_create", "exec"}
+        ]
+        browses = [
+            item["detail"]
+            for item in self._conversation_activity
+            if item["kind"] == "browse"
+        ]
+        if writes:
+            lines.append(f"- Verified local work happened in: {writes[-1]}")
+        else:
+            lines.append("- Verified local work: none yet")
+        if browses:
+            lines.append(f"- Verified browsing happened for: {browses[-1]}")
+        else:
+            lines.append("- Verified browsing: none yet")
+        lines.append(
+            "- Treat the bullets above as authoritative. "
+            "If local work is 'none yet', say so plainly."
+        )
+        return "\n".join(lines)
+
+    async def _remember_verified_tool_action(
+        self,
+        *,
+        message: str,
+        step: dict[str, Any],
+        output: str,
+    ) -> None:
+        tool = str(step.get("tool", "")).strip().lower()
+        if tool in {"", "browse"}:
+            return
+
+        privacy_rules = load_privacy_rules(DaemonConfig().state_path)
+        if (
+            should_exclude_text(message, privacy_rules)
+            or should_exclude_text(output, privacy_rules)
+        ):
+            return
+
+        workspace = self._get_workspace()
+        scope = self._workspace_scope()
+        path_hint = (
+            str(step.get("path", "")).strip()
+            or str(step.get("cwd", "")).strip()
+            or str(workspace.root)
+        )
+        redacted_message = apply_redactions(message, privacy_rules)
+        redacted_output = apply_redactions(output, privacy_rules)
+        action = self._describe_tool_step(step)
+        tags = [
+            "auto_capture",
+            "source:tool",
+            f"tool:{tool}",
+            "verified_workspace_action",
+            "project_context",
+        ]
+        importance = 0.55 if tool in {"list", "read", "git_status", "diff"} else 0.75
+        episode = Episode(
+            agent_id="jarvis",
+            session_id=uuid4(),
+            context=f"[tool request] {redacted_message}",
+            action=f"{action} (verified at {path_hint})",
+            outcome=redacted_output[:2000],
+            tags=tags,
+            importance=importance,
+            scope_type=str(scope["scope_type"]),
+            scope_id=str(scope["scope_id"]),
+            workspace_path=str(scope["workspace_path"]) if scope["workspace_path"] else None,
+            repo_name=str(scope["repo_name"]) if scope["repo_name"] else None,
+        )
+        await self._brain.memory.episodic.encode(episode)
+
     def _get_scenario_engine(self) -> ScenarioEngine:
         """Lazy-create the bounded scenario engine."""
         if self._scenario_engine is None:
@@ -1813,6 +1992,8 @@ class DaemonIPCServer:
         """User sends a message -> run cognitive cycle -> generate reply -> return."""
         if not message:
             return {"error": "message is required"}
+
+        await self._maybe_create_goal_from_message(message)
 
         tool_result = await self._handle_tool_request(message)
         if tool_result is not None:
@@ -1835,9 +2016,10 @@ class DaemonIPCServer:
         self._state.total_cycles += 1
         privacy_rules = load_privacy_rules(DaemonConfig().state_path)
 
+        active_goals = self._active_goal_descriptions()
         capture_pre = classify_interaction(
             user_message=message,
-            active_goals=self._active_goal_descriptions(),
+            active_goals=active_goals,
             source="chat",
             excluded_phrases=privacy_rules.excluded_phrases,
         )
@@ -1889,14 +2071,13 @@ class DaemonIPCServer:
                         source="chat",
                         excluded_phrases=privacy_rules.excluded_phrases,
                     )
-                    scope_metadata = self._workspace_scope()
                     await self._brain.orchestrator.update_last_episode_metadata(
                         tags=capture_post.tags,
                         importance=capture_post.importance,
-                        scope_type=scope_metadata["scope_type"],
-                        scope_id=scope_metadata["scope_id"],
-                        workspace_path=scope_metadata["workspace_path"],
-                        repo_name=scope_metadata["repo_name"],
+                        scope_type="personal",
+                        scope_id="personal",
+                        workspace_path=None,
+                        repo_name=None,
                     )
                     if citation_ids:
                         await self._brain.orchestrator.record_retrieval_feedback(
@@ -1974,6 +2155,7 @@ class DaemonIPCServer:
         try:
             browser = self._get_browser()
             result = await browser.browse(message, store_in_memory=True)
+            self._record_conversation_activity("browse", message)
             return result
         except Exception as exc:
             logger.warning("Browse request failed: %s", exc)
@@ -1987,13 +2169,29 @@ class DaemonIPCServer:
         browse_result: str = "",
     ) -> str:
         """Generate a conversational reply using full history and retrieved memories."""
+        direct_reply = self._grounded_progress_reply(message)
+        if direct_reply is not None:
+            return direct_reply
+
         try:
             llm = self._brain.control.goals._llm
             retrieved_context = deliberation.get("context", "").strip()
+            goal_context = str(deliberation.get("goal", "")).strip()
+            citation_ids = [
+                str(item) for item in deliberation.get("citation_ids", []) if str(item).strip()
+            ]
 
-            # Extract clean memory lines — only real user input, strip system noise
             memory_lines: list[str] = []
-            if retrieved_context:
+            for citation_id in citation_ids[:10]:
+                with suppress(Exception):
+                    raw_doc = await self._brain.memory.episodic._document_store.get(
+                        UUID(citation_id)
+                    )
+                    if raw_doc is not None:
+                        context = str(raw_doc.get("context", "")).strip()
+                        if context and context.lower() not in {"(empty)", "empty"}:
+                            memory_lines.append(context)
+            if not memory_lines and retrieved_context:
                 for ln in retrieved_context.splitlines():
                     ln = ln.strip()
                     for prefix in ("[episodic]", "[semantic]", "[procedural]"):
@@ -2016,6 +2214,10 @@ class DaemonIPCServer:
                 system = _JARVIS_SYSTEM_WITH_MEMORY.format(memories=mem_text)
             else:
                 system = _JARVIS_SYSTEM_BASE
+
+            system += f"\n\nLive state:\n{self._conversation_state_block()}"
+            if goal_context and goal_context != "No specific goal":
+                system += f"\n\nCurrent goal context:\n- {goal_context}"
 
             # Inject live browsing results if we did a browse
             if browse_result:
@@ -2114,6 +2316,12 @@ class DaemonIPCServer:
                 return self._tool_chat_result(message, approval_reply["reply"])
 
             output = await self._execute_tool_step(step)
+            with suppress(Exception):
+                await self._remember_verified_tool_action(
+                    message=message,
+                    step=step,
+                    output=output,
+                )
             tool_results.append({"tool": step["tool"], "output": output})
             steps_used += 1
 
@@ -2276,6 +2484,7 @@ class DaemonIPCServer:
         tool = step["tool"]
         if tool == "browse":
             result = await self._rpc_browse(step["task"])
+            self._record_conversation_activity("browse", step["task"])
             return result.get("result", "")
         if tool == "list":
             result = await self._rpc_workspace_list(step["path"])
@@ -2293,6 +2502,7 @@ class DaemonIPCServer:
                 step["content"],
                 append=step.get("append", False),
             )
+            self._record_conversation_activity("write", step["path"])
             mode = "Appended" if step.get("append") else "Wrote"
             return f"{mode} {result['bytes_written']} bytes to {result['path']}"
         if tool == "patch":
@@ -2303,6 +2513,7 @@ class DaemonIPCServer:
                 cwd=step.get("cwd"),
                 replace_all=step.get("replace_all", False),
             )
+            self._record_conversation_activity("patch", step["path"])
             return result.get("diff", "")
         if tool == "verify":
             result = await self._rpc_workspace_verify(
@@ -2333,6 +2544,10 @@ class DaemonIPCServer:
                 base_ref=step.get("base_ref", "HEAD"),
                 path=step.get("path"),
             )
+            self._record_conversation_activity(
+                "worktree_create",
+                result.get("path") or step["branch"],
+            )
             sections = [f"worktree_path={result.get('path')}"]
             if result.get("stdout"):
                 sections.append(result["stdout"])
@@ -2352,6 +2567,7 @@ class DaemonIPCServer:
             return "\n".join(sections)
 
         result = await self._rpc_workspace_exec(step["command"])
+        self._record_conversation_activity("exec", step["command"])
         sections = [
             f"exit_code={result['exit_code']}",
             f"cwd={result['cwd']}",
@@ -2431,6 +2647,12 @@ class DaemonIPCServer:
             return self._tool_chat_result(message, approval_reply["reply"])
 
         output = await self._execute_tool_step(step)
+        with suppress(Exception):
+            await self._remember_verified_tool_action(
+                message=message,
+                step=step,
+                output=output,
+            )
         return self._tool_chat_result(message, output)
 
     def _tool_chat_result(self, message: str, reply: str) -> dict[str, Any]:

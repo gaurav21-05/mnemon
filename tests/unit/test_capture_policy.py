@@ -39,3 +39,26 @@ def test_classify_interaction_skips_low_signal_chatter() -> None:
 
     assert decision.store_memory is False
     assert "ephemeral" in decision.tags
+
+
+def test_classify_interaction_keeps_short_goal_shaping_turns() -> None:
+    decision = classify_interaction(
+        user_message="Vercel",
+        assistant_reply="We'll use Vercel.",
+        active_goals=["Build a portfolio website"],
+        source="chat",
+    )
+
+    assert decision.store_memory is True
+    assert "project_context" in decision.tags
+
+
+def test_classify_interaction_marks_role_identity_statements_static() -> None:
+    decision = classify_interaction(
+        user_message="I am a full stack TypeScript developer and agentic AI developer",
+        assistant_reply="Understood.",
+        source="chat",
+    )
+
+    assert decision.store_memory is True
+    assert "profile_static" in decision.tags

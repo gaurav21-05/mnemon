@@ -16,6 +16,14 @@ _PRIVATE_MARKERS = (
 _LOW_SIGNAL_MESSAGES = {
     "ok",
     "okay",
+    "yes",
+    "y",
+    "yeah",
+    "yep",
+    "sure",
+    "no",
+    "n",
+    "nope",
     "thanks",
     "thank you",
     "ok thanks",
@@ -64,6 +72,17 @@ _PROJECT_MARKERS = (
     "feature",
 )
 
+_ROLE_MARKERS = (
+    "developer",
+    "engineer",
+    "designer",
+    "writer",
+    "founder",
+    "student",
+    "researcher",
+    "manager",
+)
+
 
 @dataclass(frozen=True)
 class CaptureDecision:
@@ -85,7 +104,7 @@ def classify_interaction(
     """Classify whether a daemon interaction should become durable memory."""
     active_goals = active_goals or []
     excluded_phrases = excluded_phrases or []
-    combined = " ".join(part for part in (user_message, assistant_reply) if part).strip()
+    combined = user_message.strip()
     lowered = combined.lower()
     user_lower = user_message.strip().lower()
 
@@ -109,13 +128,26 @@ def classify_interaction(
         tags.append("profile_static")
         importance += 0.25
 
+    if (
+        user_lower.startswith(("i am ", "i'm "))
+        and any(marker in user_lower for marker in _ROLE_MARKERS)
+    ):
+        tags.append("profile_static")
+        importance += 0.25
+
     if any(marker in lowered for marker in _DYNAMIC_MARKERS):
         tags.append("profile_dynamic")
         importance += 0.2
 
-    if any(marker in lowered for marker in _PROJECT_MARKERS) or active_goals:
+    if any(marker in lowered for marker in _PROJECT_MARKERS):
         tags.append("project_context")
         importance += 0.15
+
+    # Once Jarvis has an active goal, short follow-up turns often carry key
+    # task-shaping decisions such as style, hosting, scope, or stack choices.
+    if active_goals and 1 < len(user_lower) <= 80 and user_lower not in _LOW_SIGNAL_MESSAGES:
+        tags.append("project_context")
+        importance += 0.1
 
     if "remember" in lowered or "important" in lowered:
         importance += 0.1

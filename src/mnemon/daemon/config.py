@@ -189,7 +189,7 @@ class DaemonConfig(BaseSettings):
         description="Daemon log file path.",
     )
     autonomy_level: AutonomyLevel = Field(
-        default=AutonomyLevel.SUGGEST,
+        default=AutonomyLevel.SEMI_AUTO,
         description="Default permission level for autonomous actions.",
     )
     auto_restart: bool = Field(

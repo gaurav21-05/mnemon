@@ -18,6 +18,7 @@ Mnemon is a brain-like memory framework for AI agents, plus an always-on daemon 
 
 - **Long-running Jarvis-style daemon** with persistent goals and memory-aware chat
 - **Unix-socket IPC API** for CLI and external adapters
+- **Natural-language tool use** — Jarvis can browse the web and inspect/edit the workspace from normal chat, not only slash commands
 - **Workspace tools** for bounded file inspection, patching, verification, git diff/status, and worktrees
 - **Supervised self-improvement workflow** with analyze → plan → worktree → patch → verify → approve/abort
 - **Web UI dashboard** with live thoughts, goal management, chat, log tail, and memory search
@@ -157,6 +158,21 @@ mnemon-daemon status
 mnemon-daemon chat "Remember that I'm working on mnemon"
 mnemon-daemon goals add "Ship the daemon bridge example"
 mnemon-daemon thoughts --limit 5
+```
+
+By default Jarvis now runs in `semi_auto` mode:
+
+- low-risk tool actions like browse, list, and read execute automatically
+- medium-risk workspace actions like write, patch, and worktree creation can also execute from normal chat
+- high-risk shell execution still depends on the daemon autonomy level
+
+Examples of plain-language tool use:
+
+```bash
+mnemon-daemon chat "research browser-use and summarize the current API"
+mnemon-daemon chat "read src/mnemon/daemon/ipc.py"
+mnemon-daemon chat "write a LICENSE file in Apache 2.0 format"
+mnemon-daemon chat "patch README.md to add a quickstart section"
 ```
 
 ### Goal management
@@ -338,25 +354,24 @@ config = load_config("/path/to/mnemon.toml")
 ## Development
 
 ```bash
-# Install editable package + dev deps
-pip install -e ".[all]"
-pip install pytest pytest-asyncio pytest-benchmark hypothesis ruff mypy
+# Install project and dev tooling
+uv sync --dev
 
 # Unit tests
-pytest tests/unit -v
+uv run pytest tests/unit -v
 
 # Integration tests
-pytest tests/integration -v
+uv run pytest tests/integration -v
 
 # Whole suite
-pytest tests -v
+uv run pytest tests -v
 
 # Lint + format
-ruff check src tests examples
-ruff format src tests examples
+uv run ruff check src tests examples
+uv run ruff format src tests examples
 
 # Type-check
-mypy src/mnemon
+uv run mypy src/mnemon
 ```
 
 ## Roadmap
@@ -382,4 +397,4 @@ mypy src/mnemon
 
 ## License
 
-Apache-2.0
+[Apache-2.0](./LICENSE)

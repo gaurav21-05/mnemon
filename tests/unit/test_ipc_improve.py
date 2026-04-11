@@ -34,6 +34,7 @@ class _DummyIdleLoop:
 class _FakeEpisodicMemory:
     def __init__(self, docs: dict[UUID, dict[str, object]] | None = None) -> None:
         self._docs = docs or {}
+        self.encoded: list[object] = []
         self._document_store = SimpleNamespace(
             get=self._get_doc,
             query=self._query_docs,
@@ -80,6 +81,10 @@ class _FakeEpisodicMemory:
                 )
             ]
         )
+
+    async def encode(self, episode: object) -> object:
+        self.encoded.append(episode)
+        return getattr(episode, "id", None)
 
 
 class _FakeSemanticMemory:
@@ -139,6 +144,56 @@ def _make_server(brain: object) -> DaemonIPCServer:
         autonomy=AutonomyController(DaemonConfig()),
         idle_loop=_DummyIdleLoop(),
     )
+
+
+async def test_grounded_progress_reply_requires_verified_local_work() -> None:
+    brain = SimpleNamespace(
+        control=SimpleNamespace(goals=SimpleNamespace(get_active_goals=lambda: [])),
+        memory=SimpleNamespace(),
+    )
+    server = _make_server(brain)
+
+    reply = server._grounded_progress_reply("where is this on my local machine")
+
+    assert reply is not None
+    assert "haven't created files" in reply
+
+
+async def test_grounded_progress_reply_uses_verified_activity() -> None:
+    brain = SimpleNamespace(
+        control=SimpleNamespace(goals=SimpleNamespace(get_active_goals=lambda: [])),
+        memory=SimpleNamespace(),
+    )
+    server = _make_server(brain)
+    server._record_conversation_activity("write", "portfolio")
+
+    reply = server._grounded_progress_reply("where are you building my website")
+
+    assert reply is not None
+    assert "`portfolio`" in reply
+
+
+async def test_remember_verified_tool_action_stores_workspace_scoped_episode() -> None:
+    episodic = _FakeEpisodicMemory()
+    brain = SimpleNamespace(
+        control=SimpleNamespace(goals=SimpleNamespace(get_active_goals=lambda: [])),
+        memory=SimpleNamespace(episodic=episodic),
+    )
+    server = _make_server(brain)
+
+    await server._remember_verified_tool_action(
+        message="write portfolio/index.html with the landing page",
+        step={"tool": "write", "path": "portfolio/index.html"},
+        output="Wrote 120 bytes to portfolio/index.html",
+    )
+
+    assert len(episodic.encoded) == 1
+    episode = episodic.encoded[0]
+    assert episode.scope_type == "workspace"
+    assert episode.repo_name == server._get_workspace().root.name
+    assert "tool:write" in episode.tags
+    assert "verified_workspace_action" in episode.tags
+    assert "portfolio/index.html" in episode.action
 
 
 async def test_ipc_server_serves_fast_request_while_slow_request_is_running(

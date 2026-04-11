@@ -27,9 +27,15 @@ class _DummyIdleLoop:
 class _FakeGoalManager:
     def __init__(self, descriptions: list[str] | None = None) -> None:
         self._descriptions = descriptions or []
+        self.created: list[tuple[str, float]] = []
 
     def get_active_goals(self) -> list[object]:
         return [SimpleNamespace(description=item) for item in self._descriptions]
+
+    async def create_goal(self, description: str, priority: float = 0.5) -> object:
+        self.created.append((description, priority))
+        self._descriptions.append(description)
+        return SimpleNamespace(description=description, priority=priority)
 
 
 class _FakeOrchestrator:
@@ -232,3 +238,36 @@ async def test_rpc_chat_uses_persisted_exclusion_and_redaction_rules(
     assert brain.orchestrator.redactions == ["API_KEY_123"]
     assert brain.orchestrator.last_outcome == "Stored token [REDACTED]"
     assert redacted["reply"] == "Stored token [REDACTED]"
+
+
+async def test_rpc_chat_creates_goal_from_clear_build_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, brain = _make_server()
+
+    async def fake_handle_tool_request(_message: str) -> None:
+        return None
+
+    async def fake_is_browse_request(_message: str) -> bool:
+        return False
+
+    async def fake_generate_reply(
+        message: str,
+        deliberation: dict[str, object],
+        pending_curiosity: str = "",
+        browse_result: str = "",
+    ) -> str:
+        del message, deliberation, pending_curiosity, browse_result
+        return "I haven't started building it locally yet."
+
+    monkeypatch.setattr(server, "_handle_tool_request", fake_handle_tool_request)
+    monkeypatch.setattr(server, "_is_browse_request", fake_is_browse_request)
+    monkeypatch.setattr(server, "_generate_reply", fake_generate_reply)
+
+    await server._rpc_chat("make a portfolio website for me")
+
+    assert brain.control.goals.created == [("Build a portfolio website", 0.75)]
+    assert brain.orchestrator.last_metadata is not None
+    tags = brain.orchestrator.last_metadata["tags"]
+    assert isinstance(tags, list)
+    assert "project_context" in tags

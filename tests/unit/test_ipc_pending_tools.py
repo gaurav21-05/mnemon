@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from mnemon.daemon.autonomy import AutonomyController
-from mnemon.daemon.config import DaemonConfig
+from mnemon.daemon.config import AutonomyLevel, DaemonConfig
 from mnemon.daemon.ipc import DaemonIPCServer
 from mnemon.daemon.state import DaemonState
 
@@ -49,11 +49,12 @@ def _make_server() -> tuple[DaemonIPCServer, _FakeWorkspace]:
     brain = SimpleNamespace(
         control=SimpleNamespace(goals=SimpleNamespace(_llm=llm)),
     )
+    config = DaemonConfig(autonomy_level=AutonomyLevel.SUGGEST)
     server = DaemonIPCServer(
         socket_path=Path("/tmp/mnemon-test.sock"),
         brain=brain,
         state=DaemonState(),
-        autonomy=AutonomyController(DaemonConfig()),
+        autonomy=AutonomyController(config),
         idle_loop=_DummyIdleLoop(),
     )
     workspace = _FakeWorkspace()
@@ -101,3 +102,25 @@ async def test_slash_write_requires_approval() -> None:
     assert "Pending approval" in result["reply"]
     pending = server._autonomy.get_pending()
     assert len(pending) == 1
+
+
+async def test_write_intent_auto_executes_under_default_semi_auto() -> None:
+    llm = _DummyLLM()
+    brain = SimpleNamespace(
+        control=SimpleNamespace(goals=SimpleNamespace(_llm=llm)),
+    )
+    server = DaemonIPCServer(
+        socket_path=Path("/tmp/mnemon-test.sock"),
+        brain=brain,
+        state=DaemonState(),
+        autonomy=AutonomyController(DaemonConfig()),
+        idle_loop=_DummyIdleLoop(),
+    )
+    workspace = _FakeWorkspace()
+    server._workspace = workspace
+
+    result = await server._handle_tool_request("write notes.txt hello world")
+
+    assert result is not None
+    assert "Pending approval" not in result["reply"]
+    assert workspace.writes == [("notes.txt", "hello world", False)]
