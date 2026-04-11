@@ -177,3 +177,41 @@ async def test_execution_followup_uses_recent_chat_context() -> None:
     assert workspace.writes == [
         ("portfolio/index.html", "<html>built from resume and designs</html>", False)
     ]
+
+
+async def test_tool_planner_falls_back_to_plain_json_when_structured_fails() -> None:
+    class _FallbackLLM:
+        async def generate_structured(
+            self,
+            prompt: str,
+            response_schema: dict,
+            **kwargs: object,
+        ) -> dict:
+            del prompt, response_schema, kwargs
+            raise ValueError("schema mode unsupported")
+
+        async def generate(self, prompt: str, **kwargs: object) -> str:
+            del kwargs
+            assert "write notes.txt hello world" in prompt
+            if "Previous tool results:\n(no tool results yet)" not in prompt:
+                return '{"action":"respond","reply":"Wrote the file."}'
+            return '{"action":"write","path":"notes.txt","content":"hello world","append":false}'
+
+    brain = SimpleNamespace(
+        control=SimpleNamespace(goals=SimpleNamespace(_llm=_FallbackLLM())),
+    )
+    server = DaemonIPCServer(
+        socket_path=Path("/tmp/mnemon-test.sock"),
+        brain=brain,
+        state=DaemonState(),
+        autonomy=AutonomyController(DaemonConfig()),
+        idle_loop=_DummyIdleLoop(),
+    )
+    workspace = _FakeWorkspace()
+    server._workspace = workspace
+
+    result = await server._handle_tool_request("write notes.txt hello world")
+
+    assert result is not None
+    assert "Pending approval" not in result["reply"]
+    assert workspace.writes == [("notes.txt", "hello world", False)]

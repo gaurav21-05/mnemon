@@ -424,6 +424,22 @@ def _sanitize_tool_action(raw: dict[str, Any]) -> dict[str, Any] | None:
     return {"action": "exec", "command": command} if command else None
 
 
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        cleaned = "\n".join(line for line in lines if not line.startswith("```")).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        payload = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _looks_like_agentic_tool_request(message: str) -> bool:
     lowered = message.lower()
     if _infer_workspace_intent(message) is not None:
@@ -2431,12 +2447,29 @@ class DaemonIPCServer:
                 prompt=prompt,
                 response_schema=_TOOL_ACTION_SCHEMA,
             )
-        except Exception:
+            if isinstance(result, dict):
+                action = _sanitize_tool_action(result)
+                if action is not None:
+                    return action
+        except Exception as exc:
+            logger.warning("tool planner structured call failed: %s", exc)
+
+        fallback_prompt = (
+            f"{prompt}\n\n"
+            "Return exactly one JSON object with the chosen next action. "
+            "Do not include markdown fences or explanatory text."
+        )
+        try:
+            raw = await llm.generate(fallback_prompt)
+        except Exception as exc:
+            logger.warning("tool planner fallback call failed: %s", exc)
             return None
 
-        if not isinstance(result, dict):
+        parsed = _parse_json_object(str(raw))
+        if parsed is None:
+            logger.warning("tool planner fallback returned non-JSON output: %r", str(raw)[:300])
             return None
-        return _sanitize_tool_action(result)
+        return _sanitize_tool_action(parsed)
 
     def _action_to_step(self, action: dict[str, Any]) -> dict[str, Any]:
         step = {"tool": action["action"]}
