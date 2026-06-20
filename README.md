@@ -364,7 +364,7 @@ uv run pytest tests/unit -v
 uv run pytest tests/integration -v
 
 # Whole suite
-uv run pytest tests -v l
+uv run pytest tests -v lgit push origin your-branch-name
 
 # Lint + format
 uv run ruff check src tests examples
@@ -374,6 +374,6 @@ uv run ruff format src tests examples
 uv run mypy src/mnemon
 ```
 
-## License
+## (License)
 
 [Apache-2.0](./LICENSE)
