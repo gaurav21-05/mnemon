@@ -364,7 +364,7 @@ uv run pytest tests/unit -v
 uv run pytest tests/integration -v
 
 # Whole suite
-uv run pytest tests -v
+uv run pytest tests -v l
 
 # Lint + format
 uv run ruff check src tests examples
